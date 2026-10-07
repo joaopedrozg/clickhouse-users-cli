@@ -36,3 +36,11 @@ include = ["clickhouse_users_cli*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "clickhouse_users_cli.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

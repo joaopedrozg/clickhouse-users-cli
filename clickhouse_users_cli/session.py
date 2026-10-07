@@ -63,7 +63,9 @@ def load_session() -> ConnectionInfo:
         )
     except KeyError as e:
         raise RuntimeError(t("sess_incomplete", e=e)) from e
-    except (OSError, ValueError, TypeError) as e:
+    except Exception as e:
+        # OSError, ValueError, TypeError, yaml.YAMLError… — qualquer falha de
+        # leitura/parse vira mensagem amigável em vez de stack trace.
         raise RuntimeError(t("sess_read_fail", e=e)) from e
 
 

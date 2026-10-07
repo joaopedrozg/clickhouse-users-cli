@@ -215,11 +215,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "v_pass_long": "Máximo 128 caracteres.",
         "v_pick_one": "Selecione pelo menos 1 item (espaço marca, enter confirma).",
         # Camada de banco
-        "db_no_dep": "Dependência 'clickhouse-connect' não instalada. Rode: pip install -r requirements.txt",
+        "db_no_dep": "Dependência 'clickhouse-connect' ausente. Rode: uv sync",
         "db_connect_fail": "Falha ao conectar em {proto}://{host}:{port}: {e}",
         "db_not_connected": "Não conectado. Chame .connect() primeiro.",
         # Sessão YAML
-        "sess_no_yaml": "Dependência 'pyyaml' não instalada. Rode: pip install pyyaml",
+        "sess_no_yaml": "Dependência 'pyyaml' ausente. Rode: uv sync",
         "sess_incomplete": "Arquivo de sessão incompleto (falta {e}). Apague e salve de novo.",
         "sess_read_fail": "Não foi possível ler a sessão salva: {e}",
         # SQL builder
@@ -428,11 +428,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "v_pass_long": "Maximum 128 characters.",
         "v_pick_one": "Select at least 1 item (space toggles, enter confirms).",
         # DB layer
-        "db_no_dep": "Missing 'clickhouse-connect' dependency. Run: pip install -r requirements.txt",
+        "db_no_dep": "Missing 'clickhouse-connect' dependency. Run: uv sync",
         "db_connect_fail": "Failed to connect to {proto}://{host}:{port}: {e}",
         "db_not_connected": "Not connected. Call .connect() first.",
         # YAML session
-        "sess_no_yaml": "Missing 'pyyaml' dependency. Run: pip install pyyaml",
+        "sess_no_yaml": "Missing 'pyyaml' dependency. Run: uv sync",
         "sess_incomplete": "Saved session file is incomplete (missing {e}). Delete it and save again.",
         "sess_read_fail": "Could not read the saved session: {e}",
         # SQL builder
@@ -455,12 +455,6 @@ def detect_language() -> str:
         loc = locale.getlocale()
         if loc and loc[0]:
             candidates.append(loc[0])
-    except Exception:
-        pass
-    try:
-        dloc = locale.getdefaultlocale()
-        if dloc and dloc[0]:
-            candidates.append(dloc[0])
     except Exception:
         pass
     for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
