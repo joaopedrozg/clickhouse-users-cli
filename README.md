@@ -35,8 +35,8 @@ ch-users
 |---|---|
 | Instalar / atualizar | `pip install -U clickhouse-users-cli` |
 | Rodar | `ch-users` |
-| Do código-fonte | `pip install -r requirements.txt` + `python main.py` |
-| Requisitos | Python `>= 3.10` + conta admin no ClickHouse (ex.: `default`) |
+| Do código-fonte | `uv sync` + `uv run ch-users` |
+| Requisitos | Python `>= 3.10` ([UV](https://docs.astral.sh/uv/) gerencia tudo via `uv.lock`) + conta admin no ClickHouse (ex.: `default`) |
 | Idioma | Automático pelo sistema operacional: PT em sistemas em português, EN nos demais. Force com `CH_USERS_LANG=pt` ou `CH_USERS_LANG=en` |
 
 ---
@@ -140,11 +140,13 @@ Princípios: **opt-in explícito** (nada pré-marcado), **escape correto** (back
 ## 🧑‍💻 Desenvolvimento
 
 ```powershell
-pip install -r requirements.txt
-python main.py            # roda do fonte
-python -m build           # gera sdist + wheel em dist/
-python -m twine check dist/*   # valida (inclusive este README)
-python -m twine upload dist/*  # publica (precisa de token PyPI)
+uv sync                  # instala tudo (usa uv.lock)
+uv run ch-users          # roda o CLI do fonte
+uv run python main.py    # alternativa direta
+uv run pytest -q         # suíte de testes (44 testes, sem banco)
+uv build                 # gera sdist + wheel em dist/
+uvx twine check dist/*   # valida (inclusive este README)
+uv publish               # publica (UV_PUBLISH_TOKEN)
 ```
 
 Versão em fonte única: `clickhouse_users_cli/__init__.py` (`__version__`).
@@ -153,8 +155,9 @@ Versão em fonte única: `clickhouse_users_cli/__init__.py` (`__version__`).
 
 ```
 main.py                  # entrypoint (dev local)
-requirements.txt
 pyproject.toml           # build + metadados PyPI (comando: ch-users)
+uv.lock                  # dependências travadas
+.python-version          # Python do projeto (uv)
 clickhouse_users_cli/
   __init__.py            # __version__
   app.py                 # fluxos interativos (criar, listar, gerenciar, sessão)
