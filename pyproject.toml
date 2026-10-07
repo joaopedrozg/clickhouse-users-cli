@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clickhouse-users-cli"
+dynamic = ["version"]
+description = "CLI interativa para criar usuarios ClickHouse com privilegio minimo (least privilege)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = ["clickhouse", "cli", "users", "access-control", "least-privilege"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Topic :: Database",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "questionary>=2.0.0",
+    "clickhouse-connect>=0.8.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+ch-users = "clickhouse_users_cli.app:main"
+
+[tool.setuptools.packages.find]
+include = ["clickhouse_users_cli*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "clickhouse_users_cli.__version__" }

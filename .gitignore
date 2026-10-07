@@ -1,0 +1,14 @@
+# Build
+dist/
+build/
+*.egg-info/
+
+# Secrets (nunca commitar)
+token-pypi.txt
+.pypirc
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
