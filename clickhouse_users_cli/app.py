@@ -11,20 +11,27 @@ from clickhouse_users_cli.db import SYSTEM_DATABASES, ClickHouseAdmin, Connectio
 from clickhouse_users_cli.sql_builder import (
     PROFILE_LABELS,
     PROFILE_PRIVILEGES,
+    Department,
     GrantScope,
+    UserMetadata,
     UserSpec,
     build_activate_user_sql,
     build_all_statements,
     build_deactivate_user_sql,
     build_drop_user_sql,
     build_edit_grants_statements,
+    get_metadata_db,
 )
 from clickhouse_users_cli.style import APP_STYLE, banner, console, error, info, make_table, step, success, warn
 from clickhouse_users_cli.i18n import t
 from clickhouse_users_cli.session import SESSION_FILE
 from clickhouse_users_cli.validators import (
     validate_at_least_one,
+    validate_dept_name,
+    validate_email,
+    validate_full_name,
     validate_host,
+    validate_matricula,
     validate_new_password,
     validate_port,
     validate_required,
@@ -142,6 +149,90 @@ def ask_new_credentials() -> tuple[str, str]:
             error(t("err_pw_mismatch"))
             continue
         return username, pwd
+
+
+# ── Etapa 3b: metadados do colaborador (obrigatório) ──────────────────────────
+
+def ensure_metadata_schema(admin: ClickHouseAdmin) -> str:
+    """Garante DB + tabelas de metadados. Aborta com msg amigável se sem permissão."""
+    meta_db = get_metadata_db()
+    with console.status(t("listing_dbs"), spinner="dots"):
+        try:
+            admin.ensure_metadata_schema(meta_db)
+        except Exception as e:
+            error(t("err_meta_schema", db=meta_db, e=e))
+            info(t("hint_meta_perms", db=meta_db))
+            raise SystemExit(1)
+    return meta_db
+
+
+def _fetch_departments_or_abort(admin: ClickHouseAdmin) -> list[dict]:
+    try:
+        return admin.list_departments()
+    except Exception as e:
+        error(t("err_meta_schema", db=get_metadata_db(), e=e))
+        raise SystemExit(1)
+
+
+def flow_create_department(admin: ClickHouseAdmin, preset_name: str = "") -> dict | None:
+    """Cria 1 departamento e retorna o dict. None se cancelar/falhar."""
+    name = _ask_or_abort(
+        Q.text(t("q_dept_name"), default=preset_name, validate=validate_dept_name, style=APP_STYLE, qmark="›")
+    ).strip()
+    desc = _ask_or_abort(
+        Q.text(t("q_dept_desc"), default="", style=APP_STYLE, qmark="›")
+    ).strip()
+    with console.status(t("running"), spinner="dots"):
+        try:
+            dept_id = admin.create_department(name.strip(), desc.strip())
+        except Exception as e:
+            error(t("err_op", e=e))
+            return None
+    success(t("dept_created", name=name.strip()))
+    return {"id": dept_id, "nome": name.strip(), "descricao": desc.strip()}
+
+
+def ask_user_metadata(admin: ClickHouseAdmin, ch_username: str) -> UserMetadata:
+    """Pergunta matrícula/nome/email + departamento (só da tabela — sem digitação livre)."""
+    from clickhouse_users_cli.sql_builder import UserMetadata as _UM
+
+    step(t("meta_step_t"), t("meta_step_s"))
+    ensure_metadata_schema(admin)
+    depts = _fetch_departments_or_abort(admin)
+    if not depts:
+        error(t("err_no_depts"))
+        go = _ask_or_abort(Q.confirm(t("q_create_dept_first"), default=True, style=APP_STYLE, qmark="›"))
+        if not go:
+            raise SystemExit(1)
+        created = flow_create_department(admin)
+        if not created:
+            raise SystemExit(1)
+        depts = _fetch_departments_or_abort(admin)
+
+    matricula = _ask_or_abort(
+        Q.text(t("q_matricula"), validate=validate_matricula, style=APP_STYLE, qmark="›")
+    ).strip()
+    nome = _ask_or_abort(
+        Q.text(t("q_full_name"), validate=validate_full_name, style=APP_STYLE, qmark="›")
+    ).strip()
+    email = _ask_or_abort(
+        Q.text(t("q_email"), validate=validate_email, style=APP_STYLE, qmark="›")
+    ).strip()
+
+    # Departamento: apenas escolha da lista existente (nada de texto livre).
+    dept = _ask_or_abort(
+        Q.select(
+            t("q_dept"),
+            choices=[Q.Choice(f"{d['nome']}" + (f" — {d['descricao']}" if d.get("descricao") else ""), value=d) for d in depts],
+            style=APP_STYLE, qmark="›",
+            instruction=t("nav_hint"),
+        )
+    )
+    return _UM(
+        usuario=ch_username, matricula=matricula, nome_completo=nome,
+        email_corporativo=email, departamento_id=dept["id"], departamento_nome=dept["nome"],
+        created_by=admin.conn.username,
+    )
 
 
 # ── Etapa 4: escopo (bancos → tabelas) ────────────────────────────────────────
@@ -293,12 +384,17 @@ def ask_create_options() -> bool:
 
 # ── Etapa 6: revisão + execução ───────────────────────────────────────────────
 
-def show_review(spec: UserSpec) -> None:
+def show_review(spec: UserSpec, meta: UserMetadata | None = None) -> None:
     step(t("step_review_t"), t("step_review_s"))
     table = make_table(t("review_title"))
     table.add_column(t("col_field"), style="dim")
     table.add_column(t("col_value"), style="bold")
     table.add_row(t("f_user"), spec.username)
+    if meta is not None:
+        table.add_row(t("f_matricula"), meta.matricula)
+        table.add_row(t("f_full_name"), meta.nome_completo)
+        table.add_row(t("f_email"), meta.email_corporativo)
+        table.add_row(t("f_dept"), meta.departamento_nome)
     table.add_row(t("f_privs"), ", ".join(spec.privileges))
     table.add_row(t("f_scope"), ", ".join(s.on_clause() for s in spec.scopes))
     table.add_row(t("f_hosts"), ", ".join(spec.hosts) if spec.hosts else t("hosts_any"))
@@ -312,8 +408,8 @@ def show_review(spec: UserSpec) -> None:
         console.print(RichPanel(Syntax(sql + ";", "sql", theme="monokai"), border_style="dim"))
 
 
-def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec) -> None:
-    show_review(spec)
+def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec, meta: UserMetadata | None = None) -> None:
+    show_review(spec, meta)
     go = _ask_or_abort(Q.confirm(t("q_create_now", username=spec.username), default=True, style=APP_STYLE, qmark="›"))
     if not go:
         console.print(t("nothing_done"))
@@ -328,6 +424,16 @@ def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec) -> None:
             info(t("hint_create_perms"))
             raise SystemExit(1)
     success(t("created", username=spec.username, n=len(statements)))
+
+    if meta is not None:
+        with console.status(t("running"), spinner="dots"):
+            try:
+                admin.insert_user_metadata(meta)
+            except Exception as e:
+                error(t("meta_save_fail", e=e))
+                info(t("hint_meta_perms", db=get_metadata_db()))
+                raise SystemExit(1)
+        success(t("meta_saved", username=spec.username))
     info(t("test_hint", username=spec.username))
 
 
@@ -426,6 +532,7 @@ def ask_main_action(show_forget: bool = False) -> str:
         Q.Choice(t("act_create"), value="create"),
         Q.Choice(t("act_list"), value="list"),
         Q.Choice(t("act_manage"), value="manage"),
+        Q.Choice(t("act_depts"), value="depts"),
     ]
     if show_forget:
         choices.append(Q.Choice(t("act_forget"), value="forget"))
@@ -446,7 +553,7 @@ def _is_inactive(create_sql: str) -> bool:
 
 
 def show_user_details(admin: ClickHouseAdmin, username: str) -> tuple[str, list[str]]:
-    """Busca CREATE + GRANTS e exibe. Retorna (create_sql, grants)."""
+    """Busca CREATE + GRANTS + metadados e exibe. Retorna (create_sql, grants)."""
     try:
         create_sql = admin.show_create_user(username)
     except Exception as e:
@@ -457,12 +564,23 @@ def show_user_details(admin: ClickHouseAdmin, username: str) -> tuple[str, list[
     except Exception as e:
         error(t("err_grants", username=username, e=e))
         grants = []
+    try:
+        meta = admin.get_user_metadata(username)
+    except Exception:
+        meta = None
 
     table = make_table(t("user_title", username=username))
     table.add_column(t("col_field"), style="dim")
     table.add_column(t("col_value"), style="bold")
     status = t("status_inactive") if _is_inactive(create_sql) else t("status_active")
     table.add_row(t("col_status"), status)
+    if meta:
+        table.add_row(t("f_matricula"), meta.get("matricula", ""))
+        table.add_row(t("f_full_name"), meta.get("nome_completo", ""))
+        table.add_row(t("f_email"), meta.get("email_corporativo", ""))
+        table.add_row(t("f_dept"), meta.get("departamento_nome", ""))
+    else:
+        table.add_row(t("f_dept"), t("meta_none"))
     table.add_row(t("col_grants"), "\n".join(grants) if grants else t("grants_none"))
     console.print(table)
 
@@ -554,6 +672,88 @@ def flow_edit_grants(admin: ClickHouseAdmin, username: str) -> None:
     success(t("updated", username=username, n=len(statements)))
 
 
+# ── Departamentos (CRUD) ────────────────────────────────────────────────────
+
+def flow_manage_departments(admin: ClickHouseAdmin) -> None:
+    step(t("step_depts_t"), t("step_depts_s"))
+    ensure_metadata_schema(admin)
+    while True:
+        try:
+            depts = admin.list_departments()
+        except Exception as e:
+            error(t("err_meta_schema", db=get_metadata_db(), e=e))
+            return
+
+        if depts:
+            table = make_table(t("depts_title", n=len(depts)))
+            table.add_column(t("col_num"), style="dim")
+            table.add_column(t("col_dept"), style="bold")
+            table.add_column(t("col_desc"), style="dim")
+            for i, d in enumerate(depts, 1):
+                table.add_row(str(i), d["nome"], d.get("descricao") or "")
+            console.print(table)
+        else:
+            info(t("no_depts"))
+
+        action = _ask_or_abort(
+            Q.select(
+                t("q_dept_action"),
+                choices=[
+                    Q.Choice(t("opt_dept_create"), value="create"),
+                    Q.Choice(t("opt_dept_edit"), value="edit"),
+                    Q.Choice(t("opt_dept_delete"), value="delete"),
+                    Q.Choice(t("opt_back"), value="back"),
+                ],
+                style=APP_STYLE, qmark="›",
+            )
+        )
+        if action == "back":
+            return
+        if action == "create":
+            flow_create_department(admin)
+            continue
+        # edit/delete exigem lista não vazia
+        if not depts:
+            error(t("no_depts"))
+            continue
+        target = _ask_or_abort(
+            Q.select(
+                t("q_which_dept"),
+                choices=[Q.Choice(d["nome"], value=d) for d in depts],
+                style=APP_STYLE, qmark="›",
+                instruction=t("nav_hint"),
+            )
+        )
+        if action == "edit":
+            new_name = _ask_or_abort(
+                Q.text(t("q_dept_name"), default=target["nome"], validate=validate_dept_name, style=APP_STYLE, qmark="›")
+            ).strip()
+            new_desc = _ask_or_abort(
+                Q.text(t("q_dept_desc"), default=target.get("descricao") or "", style=APP_STYLE, qmark="›")
+            ).strip()
+            with console.status(t("running"), spinner="dots"):
+                try:
+                    admin.update_department(target["id"], new_name, new_desc)
+                except Exception as e:
+                    error(t("err_op", e=e))
+                    continue
+            success(t("dept_updated", name=new_name))
+        else:
+            go = _ask_or_abort(
+                Q.confirm(t("q_dept_delete_confirm", name=target["nome"]), default=False, style=APP_STYLE, qmark="›")
+            )
+            if not go:
+                console.print(t("nothing_done"))
+                continue
+            with console.status(t("running"), spinner="dots"):
+                try:
+                    admin.delete_department(target["id"])
+                except Exception as e:
+                    error(str(e))
+                    continue
+            success(t("dept_deleted", name=target["nome"]))
+
+
 def flow_manage_users(admin: ClickHouseAdmin) -> None:
     step(t("step_manage_t"), t("step_manage_s"))
     with console.status(t("listing_users"), spinner="dots"):
@@ -636,6 +836,7 @@ def flow_manage_users(admin: ClickHouseAdmin) -> None:
 def flow_create_user(admin: ClickHouseAdmin) -> None:
     profile = ask_profile()
     username, password = ask_new_credentials()
+    meta = ask_user_metadata(admin, username)
     databases = ask_databases(admin)
     scopes = ask_tables(admin, databases)
     privileges, grant_option = ask_privileges(profile)
@@ -653,7 +854,7 @@ def flow_create_user(admin: ClickHouseAdmin) -> None:
         if_not_exists=if_not_exists,
         grant_option=grant_option,
     )
-    confirm_and_execute(admin, spec)
+    confirm_and_execute(admin, spec, meta)
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -677,6 +878,8 @@ def main() -> None:
                 flow_list_users(admin)
             elif action == "manage":
                 flow_manage_users(admin)
+            elif action == "depts":
+                flow_manage_departments(admin)
             elif action == "forget":
                 flow_forget_session()
             else:

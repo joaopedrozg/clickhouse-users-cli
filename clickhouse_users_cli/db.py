@@ -108,3 +108,122 @@ class ClickHouseAdmin:
     def execute_statements(self, statements: list[str]) -> None:
         for sql in statements:
             self.client.command(sql)
+
+    # ── Metadados (departamentos + user_metadata) ─────────────────────────
+
+    def ensure_metadata_schema(self, db: str | None = None) -> str:
+        from clickhouse_users_cli.sql_builder import (
+            build_create_departments_table_sql,
+            build_create_metadata_db_sql,
+            build_create_user_metadata_table_sql,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        self.client.command(build_create_metadata_db_sql(meta_db))
+        self.client.command(build_create_departments_table_sql(meta_db))
+        self.client.command(build_create_user_metadata_table_sql(meta_db))
+        return meta_db
+
+    def list_departments(self, db: str | None = None) -> list[dict]:
+        from clickhouse_users_cli.sql_builder import (
+            DEPARTMENTS_TABLE,
+            escape_ident,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        rows = self.client.query(
+            f"SELECT `id`, `nome`, `descricao` FROM {escape_ident(meta_db)}.{escape_ident(DEPARTMENTS_TABLE)} ORDER BY `nome`"
+        ).result_rows
+        out: list[dict] = []
+        for r in rows or []:
+            if not r or len(r) < 2:
+                continue
+            out.append({"id": str(r[0]), "nome": str(r[1]), "descricao": str(r[2]) if len(r) > 2 else ""})
+        return out
+
+    def create_department(self, nome: str, descricao: str = "", dept_id: str | None = None, db: str | None = None) -> str:
+        import uuid as _uuid
+
+        from clickhouse_users_cli.sql_builder import build_insert_department_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        dept_id = dept_id or str(_uuid.uuid4())
+        self.client.command(build_insert_department_sql(dept_id, nome, descricao, meta_db))
+        return dept_id
+
+    def update_department(self, dept_id: str, nome: str, descricao: str = "", db: str | None = None) -> str:
+        from clickhouse_users_cli.sql_builder import build_update_department_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        sql = build_update_department_sql(dept_id, nome, descricao, meta_db)
+        self.client.command(sql)
+        return sql
+
+    def delete_department(self, dept_id: str, db: str | None = None) -> str:
+        from clickhouse_users_cli.sql_builder import (
+            build_delete_department_sql,
+            escape_string,
+            escape_ident,
+            get_metadata_db,
+            USER_METADATA_TABLE,
+        )
+
+        meta_db = db or get_metadata_db()
+        # Guarda: não excluir departamento em uso nos metadados.
+        cnt_rows = self.client.query(
+            f"SELECT count() FROM {escape_ident(meta_db)}.{escape_ident(USER_METADATA_TABLE)} "
+            f"WHERE `departamento_id` = toUUID({escape_string(dept_id)})"
+        ).result_rows
+        cnt = int(cnt_rows[0][0]) if cnt_rows and cnt_rows[0] else 0
+        if cnt > 0:
+            from clickhouse_users_cli.i18n import t
+
+            raise RuntimeError(t("dept_in_use", n=cnt))
+        sql = build_delete_department_sql(dept_id, meta_db)
+        self.client.command(sql)
+        return sql
+
+    def insert_user_metadata(
+        self,
+        meta,  # UserMetadata
+        db: str | None = None,
+    ) -> str:
+        import uuid as _uuid
+
+        from clickhouse_users_cli.sql_builder import build_insert_user_metadata_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        if not meta.id:
+            meta.id = str(_uuid.uuid4())
+        sql = build_insert_user_metadata_sql(meta, meta_db)
+        self.client.command(sql)
+        return sql
+
+    def get_user_metadata(self, username: str, db: str | None = None) -> dict | None:
+        from clickhouse_users_cli.sql_builder import (
+            USER_METADATA_TABLE,
+            escape_ident,
+            escape_string,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        rows = self.client.query(
+            f"SELECT `id`, `usuario`, `matricula`, `nome_completo`, `email_corporativo`, "
+            f"`departamento_id`, `departamento_nome` FROM {escape_ident(meta_db)}.{escape_ident(USER_METADATA_TABLE)} "
+            f"WHERE `usuario` = {escape_string(username)} ORDER BY `created_at` DESC LIMIT 1"
+        ).result_rows
+        if not rows or not rows[0]:
+            return None
+        r = rows[0]
+        return {
+            "id": str(r[0]),
+            "usuario": str(r[1]),
+            "matricula": str(r[2]),
+            "nome_completo": str(r[3]),
+            "email_corporativo": str(r[4]),
+            "departamento_id": str(r[5]),
+            "departamento_nome": str(r[6]),
+        }
