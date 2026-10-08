@@ -80,11 +80,14 @@ def test_manage_commands():
     a.deactivate_user("ana")
     a.activate_user("ana")
     a.drop_user("ana")
-    assert a.client.commands == [
-        "ALTER USER `ana` HOST NONE",
-        "ALTER USER `ana` HOST ANY",
-        "DROP USER IF EXISTS `ana`",
-    ]
+    # DDL principal primeiro; em seguida espelho em user_metadata/user_access (best-effort).
+    assert a.client.commands[0] == "ALTER USER `ana` HOST NONE"
+    assert "UPDATE `deactivated` = 1" in a.client.commands[1]
+    assert a.client.commands[2] == "ALTER USER `ana` HOST ANY"
+    assert "UPDATE `deactivated` = 0" in a.client.commands[3]
+    assert a.client.commands[4] == "DROP USER IF EXISTS `ana`"
+    assert any("UPDATE `deleted` = 1" in c for c in a.client.commands[5:])
+    assert any("UPDATE `revogado` = 1" in c for c in a.client.commands[5:])
 
 
 def test_execute_statements_runs_all():

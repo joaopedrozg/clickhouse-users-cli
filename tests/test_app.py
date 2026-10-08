@@ -94,27 +94,34 @@ def test_ask_privileges_custom(monkeypatch):
 def test_flow_edit_grants_revokes_first(monkeypatch):
     admin = MagicMock()
     admin.conn.username = "default"
-    monkeypatch.setattr(app, "ask_profile", lambda mode="create": "readwrite")
-    monkeypatch.setattr(app, "ask_privileges", lambda profile, mode="create": (["SHOW", "SELECT"], False))
-    monkeypatch.setattr(app, "ask_databases", lambda admin, mode="create": ["vendas"])
+    admin.show_grants.return_value = ["GRANT SHOW, SELECT ON `vendas`.`pedidos` TO `ana`"]
+    seen = {}
+    monkeypatch.setattr(app, "ask_profile", lambda *a, **k: seen.setdefault("profile_kw", k) or "readwrite")
+    monkeypatch.setattr(app, "ask_privileges", lambda *a, **k: (["SHOW", "SELECT"], False))
+    monkeypatch.setattr(app, "ask_databases", lambda *a, **k: seen.setdefault("db_defaults", k.get("defaults")) or ["vendas"])
     monkeypatch.setattr(app, "ask_tables",
-                         lambda admin, dbs, mode="create": [GrantScope(database="vendas", table="pedidos")])
+                         lambda *a, **k: seen.setdefault("scopes_defaults", k.get("defaults")) or [GrantScope(database="vendas", table="pedidos")])
     monkeypatch.setattr(app.Q, "confirm", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: True)
     app.flow_edit_grants(admin, "ana")
     stmts = admin.execute_statements.call_args[0][0]
     assert stmts[0] == "REVOKE ALL ON *.* FROM `ana`"
     assert stmts[1] == "GRANT SHOW, SELECT ON `vendas`.`pedidos` TO `ana`"
+    # Pré-preenchimento: perfil inferido + escopos atuais repassados como padrão.
+    assert seen["profile_kw"].get("default_profile") == "readonly"
+    assert seen["db_defaults"] == ["vendas"]
+    assert seen["scopes_defaults"] == [GrantScope(database="vendas", table="pedidos")]
 
 
 def test_flow_edit_grants_cancelled_runs_nothing(monkeypatch):
     admin = MagicMock()
     admin.conn.username = "default"
-    monkeypatch.setattr(app, "ask_profile", lambda mode="create": "readonly")
-    monkeypatch.setattr(app, "ask_privileges", lambda profile, mode="create": (["SHOW"], False))
-    monkeypatch.setattr(app, "ask_databases", lambda admin, mode="create": ["vendas"])
+    admin.show_grants.return_value = []
+    monkeypatch.setattr(app, "ask_profile", lambda *a, **k: "readonly")
+    monkeypatch.setattr(app, "ask_privileges", lambda *a, **k: (["SHOW"], False))
+    monkeypatch.setattr(app, "ask_databases", lambda *a, **k: ["vendas"])
     monkeypatch.setattr(app, "ask_tables",
-                         lambda admin, dbs, mode="create": [GrantScope(database="vendas", table=None)])
+                         lambda *a, **k: [GrantScope(database="vendas", table=None)])
     monkeypatch.setattr(app.Q, "confirm", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: False)
     app.flow_edit_grants(admin, "ana")
@@ -152,3 +159,116 @@ def test_main_menu_forget_flag(monkeypatch):
     assert "forget" not in seen["values"]
     app.ask_main_action(show_forget=True)
     assert "forget" in seen["values"]
+
+
+# ── Navegação "voltar" no fluxo de criação ────────────────────────────────────
+
+def test_ask_profile_back_raises(monkeypatch):
+    captured = {}
+
+    def fake_select(msg, choices, default, style, qmark, instruction):
+        captured["values"] = [c.value for c in choices]
+        return MagicMock()
+
+    monkeypatch.setattr(app.Q, "select", fake_select)
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: app.BACK_VALUE)
+    with pytest.raises(app.BackStep):
+        app.ask_profile(allow_back=True)
+    assert app.BACK_VALUE in captured["values"]
+
+
+def test_ask_profile_no_back_by_default(monkeypatch):
+    captured = {}
+
+    def fake_select(msg, choices, default, style, qmark, instruction):
+        captured["values"] = [c.value for c in choices]
+        return MagicMock()
+
+    monkeypatch.setattr(app.Q, "select", fake_select)
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: "readonly")
+    assert app.ask_profile() == "readonly"
+    assert app.BACK_VALUE not in captured["values"]
+
+
+def test_ask_databases_back_raises(monkeypatch):
+    admin = MagicMock()
+    admin.list_databases.return_value = ["vendas"]
+    monkeypatch.setattr(app.Q, "checkbox", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: [app.BACK_VALUE])
+    with pytest.raises(app.BackStep):
+        app.ask_databases(admin, allow_back=True)
+
+
+def test_ask_new_credentials_back_keyword(monkeypatch):
+    monkeypatch.setattr(app.Q, "text", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: ":voltar")
+    with pytest.raises(app.BackStep):
+        app.ask_new_credentials(allow_back=True)
+
+
+def test_ask_privileges_custom_back_raises(monkeypatch):
+    monkeypatch.setattr(app.Q, "checkbox", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: [app.BACK_VALUE])
+    with pytest.raises(app.BackStep):
+        app.ask_privileges("custom", allow_back=True)
+
+
+def test_ask_host_restriction_back_raises(monkeypatch):
+    monkeypatch.setattr(app.Q, "select", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: app.BACK_VALUE)
+    with pytest.raises(app.BackStep):
+        app.ask_host_restriction(allow_back=True)
+
+
+def test_confirm_and_execute_adjust_goes_back(monkeypatch):
+    from clickhouse_users_cli.sql_builder import UserSpec
+
+    spec = UserSpec(username="ana", password="x" * 9, privileges=["SELECT"],
+                    scopes=[GrantScope(database="vendas", table=None)])
+    monkeypatch.setattr(app.Q, "select", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(app, "_ask_or_abort", lambda prompt: "adjust")
+    with pytest.raises(app.BackStep):
+        app.confirm_and_execute(MagicMock(), spec, None, allow_back=True)
+
+
+def test_flow_create_user_back_then_forward(monkeypatch):
+    admin = MagicMock()
+    monkeypatch.setattr(app, "ask_profile", lambda **kw: "readonly")
+    monkeypatch.setattr(app, "ask_new_credentials", lambda **kw: ("ana", "pwd123456"))
+    meta = MagicMock()
+    meta.matricula = "123"
+    meta.nome_completo = "Ana"
+    meta.email_corporativo = "ana@empresa.com"
+    meta.departamento_id = "dept-1"
+    meta.departamento_nome = "Vendas"
+    meta_calls = {"n": 0}
+
+    def fake_meta(a, username, **kw):
+        meta_calls["n"] += 1
+        return meta
+
+    monkeypatch.setattr(app, "ask_user_metadata", fake_meta)
+    db_calls = {"n": 0}
+
+    def fake_dbs(a, **kw):
+        db_calls["n"] += 1
+        if db_calls["n"] == 1:
+            raise app.BackStep()
+        return ["vendas"]
+
+    monkeypatch.setattr(app, "ask_databases", fake_dbs)
+    monkeypatch.setattr(app, "ask_tables", lambda *a, **kw: [GrantScope(database="vendas", table=None)])
+    monkeypatch.setattr(app, "ask_privileges", lambda *a, **kw: (["SELECT"], False))
+    monkeypatch.setattr(app, "ask_host_restriction", lambda **kw: [])
+    monkeypatch.setattr(app, "ask_create_options", lambda **kw: True)
+    finished = {}
+
+    def fake_confirm(a, spec, m, **kw):
+        finished["spec"] = spec
+
+    monkeypatch.setattr(app, "confirm_and_execute", fake_confirm)
+    app.flow_create_user(admin)
+    # Voltou 1x (bancos → metadados) e refez: metadados perguntado 2x, fim ok.
+    assert meta_calls["n"] == 2
+    assert db_calls["n"] == 2
+    assert finished["spec"].username == "ana"

@@ -18,6 +18,9 @@ from clickhouse_users_cli.sql_builder import (
     escape_host,
     escape_ident,
     escape_string,
+    infer_profile,
+    parse_grant_scope,
+    parse_grants,
 )
 
 
@@ -91,3 +94,47 @@ def test_edit_grants_statements_revoke_first():
     stmts = build_edit_grants_statements("ana", ["SELECT"], [GrantScope(database="v", table="t")], False)
     assert stmts[0] == "REVOKE ALL ON *.* FROM `ana`"
     assert stmts[1] == "GRANT SELECT ON `v`.`t` TO `ana`"
+
+
+def test_parse_grant_scope():
+    assert parse_grant_scope("*.*") == GrantScope(database="*", table=None)
+    assert parse_grant_scope("`vendas`.*") == GrantScope(database="vendas", table=None)
+    assert parse_grant_scope("`vendas`.`pedidos`") == GrantScope(database="vendas", table="pedidos")
+    assert parse_grant_scope("vendas.pedidos") == GrantScope(database="vendas", table="pedidos")
+    assert parse_grant_scope("`a``b`.`t`") == GrantScope(database="a`b", table="t")
+
+
+def test_parse_grants_union_and_grant_option():
+    privs, scopes, grant, hetero = parse_grants([
+        "GRANT SHOW, SELECT ON `vendas`.`pedidos` TO `ana`",
+        "GRANT SELECT ON `vendas`.`clientes` TO `ana` WITH GRANT OPTION",
+    ])
+    assert privs == ["SHOW", "SELECT"]
+    assert scopes == [GrantScope(database="vendas", table="pedidos"),
+                      GrantScope(database="vendas", table="clientes")]
+    assert grant is True
+    assert hetero is True
+
+
+def test_parse_grants_single_row_not_hetero():
+    privs, scopes, grant, hetero = parse_grants(["GRANT ALL ON *.* TO `ana` WITH GRANT OPTION"])
+    assert privs == ["ALL"]
+    assert scopes == [GrantScope(database="*", table=None)]
+    assert grant is True
+    assert hetero is False
+
+
+def test_parse_grants_ignores_garbage():
+    assert parse_grants([]) == ([], [], False, False)
+    assert parse_grants(None) == ([], [], False, False)
+    assert parse_grants(["", "not a grant"]) == ([], [], False, False)
+
+
+def test_infer_profile():
+    assert infer_profile(["SHOW", "SELECT"]) == "readonly"
+    assert infer_profile(["SELECT", "SHOW"]) == "readonly"
+    assert infer_profile(["SHOW", "SELECT", "INSERT"]) == "readwrite"
+    assert infer_profile(["ALL"], True) == "admin"
+    assert infer_profile(["SELECT"]) == "custom"
+    assert infer_profile([]) == "custom"
+    assert infer_profile(None) == "custom"
