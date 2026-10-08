@@ -85,24 +85,50 @@ class ClickHouseAdmin:
         return rows[0][0] if rows and rows[0] else ""
 
     def deactivate_user(self, username: str) -> str:
-        from clickhouse_users_cli.sql_builder import build_deactivate_user_sql
+        from clickhouse_users_cli.sql_builder import (
+            build_deactivate_user_sql,
+            build_set_user_deactivated_sql,
+        )
 
         sql = build_deactivate_user_sql(username)
         self.client.command(sql)
+        try:  # espelha o estado no user_metadata (best-effort)
+            self.client.command(build_set_user_deactivated_sql(username, True))
+        except Exception:
+            pass
         return sql
 
     def activate_user(self, username: str) -> str:
-        from clickhouse_users_cli.sql_builder import build_activate_user_sql
+        from clickhouse_users_cli.sql_builder import (
+            build_activate_user_sql,
+            build_set_user_deactivated_sql,
+        )
 
         sql = build_activate_user_sql(username)
         self.client.command(sql)
+        try:
+            self.client.command(build_set_user_deactivated_sql(username, False))
+        except Exception:
+            pass
         return sql
 
     def drop_user(self, username: str) -> str:
-        from clickhouse_users_cli.sql_builder import build_drop_user_sql
+        from clickhouse_users_cli.sql_builder import (
+            build_drop_user_sql,
+            build_revoke_user_access_sql,
+            build_soft_delete_user_metadata_sql,
+        )
 
         sql = build_drop_user_sql(username)
         self.client.command(sql)
+        try:  # soft-delete + revoga acessos vigentes (histórico preservado)
+            self.client.command(build_soft_delete_user_metadata_sql(username))
+        except Exception:
+            pass
+        try:
+            self.client.command(build_revoke_user_access_sql(username))
+        except Exception:
+            pass
         return sql
 
     def execute_statements(self, statements: list[str]) -> None:
@@ -113,8 +139,11 @@ class ClickHouseAdmin:
 
     def ensure_metadata_schema(self, db: str | None = None) -> str:
         from clickhouse_users_cli.sql_builder import (
+            build_alter_user_metadata_lifecycle_sql,
             build_create_departments_table_sql,
             build_create_metadata_db_sql,
+            build_create_usage_logs_table_sql,
+            build_create_user_access_table_sql,
             build_create_user_metadata_table_sql,
             get_metadata_db,
         )
@@ -123,6 +152,14 @@ class ClickHouseAdmin:
         self.client.command(build_create_metadata_db_sql(meta_db))
         self.client.command(build_create_departments_table_sql(meta_db))
         self.client.command(build_create_user_metadata_table_sql(meta_db))
+        # Migração idempotente p/ instalações antigas (sem updated/deleted/deactivated).
+        for sql in build_alter_user_metadata_lifecycle_sql(meta_db):
+            try:
+                self.client.command(sql)
+            except Exception:
+                pass  # coluna já existe em versões antigas do CH sem IF NOT EXISTS
+        self.client.command(build_create_user_access_table_sql(meta_db))
+        self.client.command(build_create_usage_logs_table_sql(meta_db))
         return meta_db
 
     def list_departments(self, db: str | None = None) -> list[dict]:
@@ -210,11 +247,35 @@ class ClickHouseAdmin:
         )
 
         meta_db = db or get_metadata_db()
-        rows = self.client.query(
-            f"SELECT `id`, `usuario`, `matricula`, `nome_completo`, `email_corporativo`, "
-            f"`departamento_id`, `departamento_nome` FROM {escape_ident(meta_db)}.{escape_ident(USER_METADATA_TABLE)} "
-            f"WHERE `usuario` = {escape_string(username)} ORDER BY `created_at` DESC LIMIT 1"
-        ).result_rows
+        try:
+            rows = self.client.query(
+                f"SELECT `id`, `usuario`, `matricula`, `nome_completo`, `email_corporativo`, "
+                f"`departamento_id`, `departamento_nome`, `created_at`, `updated_at`, "
+                f"`deleted`, `deactivated` FROM {escape_ident(meta_db)}.{escape_ident(USER_METADATA_TABLE)} "
+                f"WHERE `usuario` = {escape_string(username)} ORDER BY `created_at` DESC LIMIT 1"
+            ).result_rows
+        except Exception:
+            # Fallback p/ tabelas antigas (sem updated_at/deleted/deactivated).
+            rows = self.client.query(
+                f"SELECT `id`, `usuario`, `matricula`, `nome_completo`, `email_corporativo`, "
+                f"`departamento_id`, `departamento_nome` FROM {escape_ident(meta_db)}.{escape_ident(USER_METADATA_TABLE)} "
+                f"WHERE `usuario` = {escape_string(username)} ORDER BY `created_at` DESC LIMIT 1"
+            ).result_rows
+            if not rows or not rows[0]:
+                return None
+            r = rows[0]
+            return {
+                "id": str(r[0]),
+                "usuario": str(r[1]),
+                "matricula": str(r[2]),
+                "nome_completo": str(r[3]),
+                "email_corporativo": str(r[4]),
+                "departamento_id": str(r[5]),
+                "departamento_nome": str(r[6]),
+                "updated_at": "",
+                "deleted": 0,
+                "deactivated": 0,
+            }
         if not rows or not rows[0]:
             return None
         r = rows[0]
@@ -226,4 +287,157 @@ class ClickHouseAdmin:
             "email_corporativo": str(r[4]),
             "departamento_id": str(r[5]),
             "departamento_nome": str(r[6]),
+            "created_at": str(r[7]) if len(r) > 7 else "",
+            "updated_at": str(r[8]) if len(r) > 8 else "",
+            "deleted": int(r[9]) if len(r) > 9 else 0,
+            "deactivated": int(r[10]) if len(r) > 10 else 0,
         }
+
+    def touch_user_metadata(self, username: str, db: str | None = None) -> str:
+        """Carimba `updated_at = now()` após qualquer alteração nos metadados."""
+        from clickhouse_users_cli.sql_builder import build_touch_user_metadata_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        sql = build_touch_user_metadata_sql(username, meta_db)
+        self.client.command(sql)
+        return sql
+
+    # ── Acessos (user_access: o que cada usuário tem acesso) ─────────────────
+
+    def sync_user_access(
+        self,
+        username: str,
+        privileges: list[str],
+        scopes,  # list[GrantScope]
+        grant_option: bool = False,
+        db: str | None = None,
+    ) -> int:
+        """Zera acessos vigentes (revogado=1) e grava o snapshot atual.
+
+        Retorna nº de linhas inseridas. Best-effort: não falha o fluxo principal.
+        """
+        from clickhouse_users_cli.sql_builder import (
+            UserAccessEntry,
+            build_insert_user_access_sql,
+            build_revoke_user_access_sql,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        try:
+            self.client.command(build_revoke_user_access_sql(username, meta_db))
+        except Exception:
+            pass
+        privs = ", ".join(privileges)
+        n = 0
+        for s in scopes or []:
+            entry = UserAccessEntry(
+                usuario=username,
+                privilegios=privs,
+                database=s.database,
+                tabela="" if s.table in (None, "*") else s.table,
+                grant_option=bool(grant_option),
+                created_by=self.conn.username,
+            )
+            try:
+                self.client.command(build_insert_user_access_sql(entry, meta_db))
+                n += 1
+            except Exception:
+                continue
+        return n
+
+    def list_user_access(self, username: str, db: str | None = None, include_revoked: bool = False) -> list[dict]:
+        from clickhouse_users_cli.sql_builder import (
+            USER_ACCESS_TABLE,
+            escape_ident,
+            escape_string,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        where = f"WHERE `usuario` = {escape_string(username)}"
+        if not include_revoked:
+            where += " AND `revogado` = 0"
+        rows = self.client.query(
+            f"SELECT `privilegios`, `database`, `tabela`, `grant_option`, `created_at`, `revogado` "
+            f"FROM {escape_ident(meta_db)}.{escape_ident(USER_ACCESS_TABLE)} "
+            f"{where} ORDER BY `database`, `tabela`"
+        ).result_rows
+        out: list[dict] = []
+        for r in rows or []:
+            if not r:
+                continue
+            out.append({
+                "privilegios": str(r[0]),
+                "database": str(r[1]),
+                "tabela": str(r[2]) if len(r) > 2 else "",
+                "grant_option": int(r[3]) if len(r) > 3 else 0,
+                "created_at": str(r[4]) if len(r) > 4 else "",
+                "revogado": int(r[5]) if len(r) > 5 else 0,
+            })
+        return out
+
+    # ── Logs de utilização (usage_logs: tabelas + queries por usuário) ────────
+
+    def log_usage(
+        self,
+        username: str,
+        query: str,
+        tabelas: list[str] | None = None,
+        tipo_query: str = "",
+        duracao_ms: int = 0,
+        status: str = "OK",
+        db: str | None = None,
+    ) -> str:
+        """Registra 1 uso manual (auditoria). Retorna o SQL executado."""
+        from clickhouse_users_cli.sql_builder import UsageLogEntry, build_insert_usage_log_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        entry = UsageLogEntry(
+            usuario=username, query=query, tabelas=tabelas or [],
+            tipo_query=tipo_query or query.strip().split(" ", 1)[0].upper() if query.strip() else "",
+            duracao_ms=duracao_ms, status=status,
+        )
+        entry.created_by = self.conn.username  # type: ignore[attr-defined]
+        sql = build_insert_usage_log_sql(entry, meta_db)
+        self.client.command(sql)
+        return sql
+
+    def import_query_log(self, username: str, limit: int = 100, db: str | None = None) -> str:
+        """Puxa as últimas `limit` queries de system.query_log para usage_logs."""
+        from clickhouse_users_cli.sql_builder import build_import_query_log_sql, get_metadata_db
+
+        meta_db = db or get_metadata_db()
+        sql = build_import_query_log_sql(username, limit, meta_db)
+        self.client.command(sql)
+        return sql
+
+    def list_usage_logs(self, username: str, limit: int = 20, db: str | None = None) -> list[dict]:
+        from clickhouse_users_cli.sql_builder import (
+            USAGE_LOGS_TABLE,
+            escape_ident,
+            escape_string,
+            get_metadata_db,
+        )
+
+        meta_db = db or get_metadata_db()
+        lim = max(1, int(limit))
+        rows = self.client.query(
+            f"SELECT `query`, `tabelas`, `tipo_query`, `executada_em`, `duracao_ms`, `status` "
+            f"FROM {escape_ident(meta_db)}.{escape_ident(USAGE_LOGS_TABLE)} "
+            f"WHERE `usuario` = {escape_string(username)} "
+            f"ORDER BY `executada_em` DESC LIMIT {lim}"
+        ).result_rows
+        out: list[dict] = []
+        for r in rows or []:
+            if not r:
+                continue
+            out.append({
+                "query": str(r[0]),
+                "tabelas": list(r[1]) if len(r) > 1 and r[1] else [],
+                "tipo_query": str(r[2]) if len(r) > 2 else "",
+                "executada_em": str(r[3]) if len(r) > 3 else "",
+                "duracao_ms": int(r[4]) if len(r) > 4 else 0,
+                "status": str(r[5]) if len(r) > 5 else "",
+            })
+        return out

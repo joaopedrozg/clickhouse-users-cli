@@ -131,6 +131,97 @@ def build_edit_grants_statements(
     return [build_revoke_all_sql(username), *build_grant_sql(spec)]
 
 
+# ── Leitura de grants atuais (pré-preencher a edição) ─────────────────────────
+
+import re as _re
+
+
+def _unquote_ident(part: str) -> str:
+    p = (part or "").strip()
+    if len(p) >= 2 and p.startswith("`") and p.endswith("`"):
+        return p[1:-1].replace("``", "`")
+    return p
+
+
+_GRANT_RE = _re.compile(
+    r"^\s*GRANT\s+(?P<privs>.+?)\s+ON\s+(?P<scope>\S+)\s+TO\s+.+?$",
+    _re.IGNORECASE | _re.DOTALL,
+)
+_SCOPE_PARTS_RE = _re.compile(r"`(?:``|[^`])*`|[^\.]+")
+_WITH_GRANT_RE = _re.compile(r"\s+WITH\s+GRANT\s+OPTION\s*$", _re.IGNORECASE)
+
+
+def parse_grant_scope(text: str) -> GrantScope:
+    """Converte `bd`.*, `bd`.`tb`, db.tbl ou *.* em GrantScope (tolerante)."""
+    t = (text or "").strip()
+    if t == "*.*":
+        return GrantScope(database="*", table=None)
+    parts = _SCOPE_PARTS_RE.findall(t)
+    if len(parts) >= 2:
+        db = _unquote_ident(parts[0])
+        tb_raw = parts[1].strip()
+        if tb_raw == "*":
+            return GrantScope(database=db, table=None)
+        return GrantScope(database=db, table=_unquote_ident(tb_raw))
+    if len(parts) == 1:
+        return GrantScope(database=_unquote_ident(parts[0]), table=None)
+    return GrantScope(database=t, table=None)
+
+
+def parse_grants(rows: list[str] | None) -> tuple[list[str], list[GrantScope], bool, bool]:
+    """Interpreta linhas de SHOW GRANTS FOR.
+
+    Retorna (privilégios-união, escopos, grant_option, heterogêneo).
+    `heterogêneo` = True quando os privilégios variam por escopo — a edição
+    normaliza para um conjunto único (o preview mostra o resultado).
+    """
+    privileges: list[str] = []
+    seen_privs: set[str] = set()
+    scopes: list[GrantScope] = []
+    seen_scopes: set[tuple[str, str | None]] = set()
+    grant_option = False
+    priv_sets: set[tuple[str, ...]] = set()
+    try:
+        items = list(rows or [])
+    except TypeError:
+        return [], [], False, False
+    for row in items:
+        if not isinstance(row, str) or not row.strip():
+            continue
+        m = _GRANT_RE.match(row.strip())
+        if not m:
+            continue
+        privs = [p.strip().upper() for p in m.group("privs").split(",") if p.strip()]
+        if not privs:
+            continue
+        tail = row.strip()
+        if _WITH_GRANT_RE.search(tail):
+            grant_option = True
+        priv_sets.add(tuple(privs))
+        for p in privs:
+            if p not in seen_privs:
+                seen_privs.add(p)
+                privileges.append(p)
+        scope = parse_grant_scope(m.group("scope"))
+        key = (scope.database, scope.table)
+        if key not in seen_scopes:
+            seen_scopes.add(key)
+            scopes.append(scope)
+    return privileges, scopes, grant_option, len(priv_sets) > 1
+
+
+def infer_profile(privileges: list[str] | None, grant_option: bool = False) -> str:
+    """Perfil mais próximo dos privilégios atuais (p/ pré-selecionar na edição)."""
+    s = {p.strip().upper() for p in (privileges or []) if p and p.strip()}
+    if s == {"ALL"}:
+        return "admin"
+    if s == {"SHOW", "SELECT"}:
+        return "readonly"
+    if s == {"SHOW", "SELECT", "INSERT"}:
+        return "readwrite"
+    return "custom"
+
+
 # ── Metadados (tabelas gerenciadas pelo CLI) ──────────────────────────────────
 
 import os as _os
@@ -138,6 +229,8 @@ import os as _os
 DEFAULT_METADATA_DB = "ch_users_mgmt"
 DEPARTMENTS_TABLE = "departments"
 USER_METADATA_TABLE = "user_metadata"
+USER_ACCESS_TABLE = "user_access"
+USAGE_LOGS_TABLE = "usage_logs"
 
 
 def get_metadata_db() -> str:
@@ -162,6 +255,36 @@ class UserMetadata:
     departamento_id: str = ""
     departamento_nome: str = ""
     created_by: str = ""
+    # Ciclo de vida (soft-delete / desativação reversível):
+    #  updated_at  = última alteração dos metadados
+    #  deleted     = 0 ativo / 1 excluído (soft-delete, mantém histórico)
+    #  deactivated = 0 ativo / 1 desativado (HOST NONE, reversível)
+
+
+@dataclass
+class UserAccessEntry:
+    """Um acesso concedido: o que cada usuário tem acesso (1 linha por escopo)."""
+
+    usuario: str = ""
+    privilegios: str = ""  # ex.: "SELECT, SHOW"
+    database: str = ""
+    tabela: str = ""  # "" = banco.* (todas as tabelas, atuais e futuras)
+    grant_option: bool = False
+    created_by: str = ""
+    revogado: bool = False
+
+
+@dataclass
+class UsageLogEntry:
+    """Log de utilização: quais tabelas/queries cada usuário executou."""
+
+    usuario: str = ""
+    query: str = ""
+    tabelas: list[str] | None = None  # ex.: ["vendas.pedidos"]
+    tipo_query: str = ""  # ex.: SELECT / INSERT / CREATE ...
+    executada_em: str = ""  # vazio = now() no INSERT
+    duracao_ms: int = 0
+    status: str = "OK"
 
 
 def build_create_metadata_db_sql(db: str | None = None) -> str:
@@ -185,8 +308,53 @@ def build_create_user_metadata_table_sql(db: str | None = None, table: str = USE
         f"(`id` UUID DEFAULT generateUUIDv4(), `usuario` String, `matricula` String, "
         f"`nome_completo` String, `email_corporativo` String, "
         f"`departamento_id` UUID, `departamento_nome` String, "
-        f"`created_at` DateTime DEFAULT now(), `created_by` String DEFAULT '') "
+        f"`created_at` DateTime DEFAULT now(), `created_by` String DEFAULT '', "
+        f"`updated_at` DateTime DEFAULT now(), "
+        f"`deleted` UInt8 DEFAULT 0, `deactivated` UInt8 DEFAULT 0) "
         f"ENGINE = MergeTree ORDER BY (`usuario`, `id`)"
+    )
+
+
+def build_alter_user_metadata_lifecycle_sql(
+    db: str | None = None, table: str = USER_METADATA_TABLE,
+) -> list[str]:
+    """Migração para bancos já existentes: adiciona updated_at/deleted/deactivated.
+
+    Idempotente (ADD COLUMN IF NOT EXISTS) — rode em todo ensure_metadata_schema.
+    """
+    db = db or get_metadata_db()
+    base = f"{escape_ident(db)}.{escape_ident(table)}"
+    return [
+        f"ALTER TABLE {base} ADD COLUMN IF NOT EXISTS `updated_at` DateTime DEFAULT now()",
+        f"ALTER TABLE {base} ADD COLUMN IF NOT EXISTS `deleted` UInt8 DEFAULT 0",
+        f"ALTER TABLE {base} ADD COLUMN IF NOT EXISTS `deactivated` UInt8 DEFAULT 0",
+    ]
+
+
+def build_create_user_access_table_sql(db: str | None = None, table: str = USER_ACCESS_TABLE) -> str:
+    """Tabela de acessos: o que cada usuário tem acesso (1 linha por escopo)."""
+    db = db or get_metadata_db()
+    return (
+        f"CREATE TABLE IF NOT EXISTS {escape_ident(db)}.{escape_ident(table)} "
+        f"(`id` UUID DEFAULT generateUUIDv4(), `usuario` String, "
+        f"`privilegios` String, `database` String, `tabela` String DEFAULT '', "
+        f"`grant_option` UInt8 DEFAULT 0, "
+        f"`created_at` DateTime DEFAULT now(), `created_by` String DEFAULT '', "
+        f"`revogado` UInt8 DEFAULT 0) "
+        f"ENGINE = MergeTree ORDER BY (`usuario`, `database`, `tabela`, `id`)"
+    )
+
+
+def build_create_usage_logs_table_sql(db: str | None = None, table: str = USAGE_LOGS_TABLE) -> str:
+    """Logs de utilização: quais tabelas/queries cada usuário executou."""
+    db = db or get_metadata_db()
+    return (
+        f"CREATE TABLE IF NOT EXISTS {escape_ident(db)}.{escape_ident(table)} "
+        f"(`id` UUID DEFAULT generateUUIDv4(), `usuario` String, "
+        f"`query` String, `tabelas` Array(String), `tipo_query` String DEFAULT '', "
+        f"`executada_em` DateTime DEFAULT now(), `duracao_ms` UInt32 DEFAULT 0, "
+        f"`status` String DEFAULT 'OK', `created_by` String DEFAULT '') "
+        f"ENGINE = MergeTree ORDER BY (`usuario`, `executada_em`, `id`)"
     )
 
 
@@ -235,4 +403,122 @@ def build_insert_user_metadata_sql(
         f"{escape_string(meta.matricula)}, {escape_string(meta.nome_completo)}, "
         f"{escape_string(meta.email_corporativo)}, toUUID({escape_string(meta.departamento_id)}), "
         f"{escape_string(meta.departamento_nome)}, {escape_string(meta.created_by)})"
+    )
+
+
+def build_touch_user_metadata_sql(
+    username: str, db: str | None = None, table: str = USER_METADATA_TABLE,
+) -> str:
+    """Atualiza `updated_at` (carimba alteração sem mudar os demais campos)."""
+    db = db or get_metadata_db()
+    return (
+        f"ALTER TABLE {escape_ident(db)}.{escape_ident(table)} "
+        f"UPDATE `updated_at` = now() WHERE `usuario` = {escape_string(username)}"
+    )
+
+
+def build_set_user_deactivated_sql(
+    username: str, deactivated: bool = True,
+    db: str | None = None, table: str = USER_METADATA_TABLE,
+) -> str:
+    db = db or get_metadata_db()
+    val = 1 if deactivated else 0
+    return (
+        f"ALTER TABLE {escape_ident(db)}.{escape_ident(table)} "
+        f"UPDATE `deactivated` = {val}, `updated_at` = now() "
+        f"WHERE `usuario` = {escape_string(username)}"
+    )
+
+
+def build_soft_delete_user_metadata_sql(
+    username: str, db: str | None = None, table: str = USER_METADATA_TABLE,
+) -> str:
+    """Soft-delete: marca `deleted` = 1 (mantém histórico; DROP USER é separado)."""
+    db = db or get_metadata_db()
+    return (
+        f"ALTER TABLE {escape_ident(db)}.{escape_ident(table)} "
+        f"UPDATE `deleted` = 1, `updated_at` = now() "
+        f"WHERE `usuario` = {escape_string(username)}"
+    )
+
+
+def build_restore_user_metadata_sql(
+    username: str, db: str | None = None, table: str = USER_METADATA_TABLE,
+) -> str:
+    db = db or get_metadata_db()
+    return (
+        f"ALTER TABLE {escape_ident(db)}.{escape_ident(table)} "
+        f"UPDATE `deleted` = 0, `deactivated` = 0, `updated_at` = now() "
+        f"WHERE `usuario` = {escape_string(username)}"
+    )
+
+
+# ── Acessos (user_access) ─────────────────────────────────────────────────────
+
+def build_insert_user_access_sql(
+    entry: UserAccessEntry, db: str | None = None, table: str = USER_ACCESS_TABLE,
+) -> str:
+    import uuid as _uuid
+
+    db = db or get_metadata_db()
+    entry_id = str(getattr(entry, "id", "") or _uuid.uuid4())
+    grant = 1 if entry.grant_option else 0
+    rev = 1 if entry.revogado else 0
+    return (
+        f"INSERT INTO {escape_ident(db)}.{escape_ident(table)} "
+        f"(`id`, `usuario`, `privilegios`, `database`, `tabela`, "
+        f"`grant_option`, `created_by`, `revogado`) VALUES "
+        f"(toUUID({escape_string(entry_id)}), {escape_string(entry.usuario)}, "
+        f"{escape_string(entry.privilegios)}, {escape_string(entry.database)}, "
+        f"{escape_string(entry.tabela)}, {grant}, {escape_string(entry.created_by)}, {rev})"
+    )
+
+
+def build_revoke_user_access_sql(
+    username: str, db: str | None = None, table: str = USER_ACCESS_TABLE,
+) -> str:
+    """Marca todos os acessos vigentes como revogados (histórico preservado)."""
+    db = db or get_metadata_db()
+    return (
+        f"ALTER TABLE {escape_ident(db)}.{escape_ident(table)} "
+        f"UPDATE `revogado` = 1 WHERE `usuario` = {escape_string(username)} AND `revogado` = 0"
+    )
+
+
+# ── Logs de utilização (usage_logs) ───────────────────────────────────────────
+
+def build_insert_usage_log_sql(
+    entry: UsageLogEntry, db: str | None = None, table: str = USAGE_LOGS_TABLE,
+) -> str:
+    db = db or get_metadata_db()
+    tabelas = entry.tabelas or []
+    arr = "[" + ", ".join(escape_string(t) for t in tabelas) + "]"
+    return (
+        f"INSERT INTO {escape_ident(db)}.{escape_ident(table)} "
+        f"(`usuario`, `query`, `tabelas`, `tipo_query`, `duracao_ms`, `status`, `created_by`) VALUES "
+        f"({escape_string(entry.usuario)}, {escape_string(entry.query)}, {arr}, "
+        f"{escape_string(entry.tipo_query)}, {int(entry.duracao_ms)}, "
+        f"{escape_string(entry.status)}, {escape_string(getattr(entry, 'created_by', ''))})"
+    )
+
+
+def build_import_query_log_sql(
+    username: str, limit: int = 100,
+    db: str | None = None, table: str = USAGE_LOGS_TABLE,
+) -> str:
+    """Importa as últimas queries de `system.query_log` para a tabela de uso.
+
+    Útil para auditoria: quais tabelas/queries cada user executou.
+    Requer acesso a `system.query_log`.
+    """
+    db = db or get_metadata_db()
+    lim = max(1, int(limit))
+    return (
+        f"INSERT INTO {escape_ident(db)}.{escape_ident(table)} "
+        f"(`usuario`, `query`, `tabelas`, `tipo_query`, `executada_em`, `duracao_ms`, `status`) "
+        f"SELECT `user`, `query`, `tables`, `query_kind`, `event_time`, "
+        f"toUInt32(`query_duration_ms`), `type` "
+        f"FROM system.query_log "
+        f"WHERE `user` = {escape_string(username)} AND `type` = 'QueryFinish' "
+        f"ORDER BY `event_time` DESC LIMIT {lim}"
     )

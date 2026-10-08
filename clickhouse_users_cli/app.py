@@ -50,6 +50,72 @@ def _ask_or_abort(prompt):
     return answer
 
 
+# ── Navegação "voltar" no fluxo de criação ─────────────────────────────────────
+
+class BackStep(Exception):
+    """Sinal interno: o usuário escolheu voltar à etapa anterior."""
+
+    pass
+
+
+BACK_VALUE = "__BACK__"
+BACK_KEYWORDS = (":voltar", ":back", ":v", "<<")
+BACK_HINT_SHOWN: set[str] = set()
+
+
+def _is_back_keyword(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower() in BACK_KEYWORDS
+
+
+def _back_choice():
+    """Opção '← Voltar' para prompts de lista (select/checkbox)."""
+    return Q.Choice(t("opt_back_to_prev"), value=BACK_VALUE)
+
+
+def _raise_if_back(answer: object) -> None:
+    """Levanta BackStep se a resposta for a opção/palavra-chave de voltar."""
+    if answer == BACK_VALUE or _is_back_keyword(answer):
+        raise BackStep()
+
+
+def _maybe_back_hint(step_key: str = "create") -> None:
+    """Explica como voltar (1x por sessão — evita poluir toda etapa)."""
+    if step_key not in BACK_HINT_SHOWN:
+        BACK_HINT_SHOWN.add(step_key)
+        info(t("back_hint"))
+
+
+def _with_back_validator(validator):
+    """Envolve um validador de texto/senha para deixar ':voltar' passar."""
+    def _wrapped(value):
+        if _is_back_keyword(value):
+            return True
+        if validator is None:
+            return True
+        return validator(value)
+
+    return _wrapped
+
+
+def _ask_confirm_or_back(question: str, default: bool = True) -> bool:
+    """Sim/Não/Voltar (usado no lugar de `confirm` quando voltar é permitido)."""
+    ans = _ask_or_abort(
+        Q.select(
+            question,
+            choices=[
+                Q.Choice(t("yes"), value=True),
+                Q.Choice(t("no"), value=False),
+                _back_choice(),
+            ],
+            default=default,
+            style=APP_STYLE, qmark="›",
+            instruction=t("nav_hint"),
+        )
+    )
+    _raise_if_back(ans)
+    return bool(ans)
+
+
 # ── Etapa 1: conexão ──────────────────────────────────────────────────────────
 
 def ask_connection() -> ConnectionInfo:
@@ -114,39 +180,61 @@ def connect_with_retry(conn: ConnectionInfo) -> ClickHouseAdmin:
 
 # ── Etapa 2: perfil do novo usuário ───────────────────────────────────────────
 
-def ask_profile(mode: str = "create") -> str:
+def ask_profile(mode: str = "create", allow_back: bool = False, default_profile: str = "readonly") -> str:
     if mode == "edit":
         step(t("estep_profile_t"), t("estep_profile_s"))
         question = t("q_new_type")
     else:
         step(t("step_profile_t"), t("step_profile_s"))
         question = t("q_create_type")
-    return _ask_or_abort(
+    choices = [Q.Choice(PROFILE_LABELS[k], value=k) for k in ("readonly", "readwrite", "admin", "custom")]
+    if allow_back:
+        choices.append(_back_choice())
+        _maybe_back_hint("create")
+    ans = _ask_or_abort(
         Q.select(
             question,
-            choices=[Q.Choice(PROFILE_LABELS[k], value=k) for k in ("readonly", "readwrite", "admin", "custom")],
-            default="readonly",
+            choices=choices,
+            default=default_profile,
             style=APP_STYLE, qmark="›",
             instruction=t("nav_hint"),
         )
     )
+    _raise_if_back(ans)
+    return ans
 
 
 # ── Etapa 3: credenciais do novo usuário ──────────────────────────────────────
 
-def ask_new_credentials() -> tuple[str, str]:
+def ask_new_credentials(allow_back: bool = False, default_username: str = "") -> tuple[str, str]:
     step(t("step_creds_t"), t("step_creds_s"))
-    username = _ask_or_abort(
-        Q.text(t("q_new_name"), validate=validate_username, style=APP_STYLE, qmark="›")
-    ).strip()
-
+    if allow_back:
+        _maybe_back_hint("create")
+    username = (default_username or "").strip()
+    need_username = True
     while True:
+        if need_username:
+            raw = _ask_or_abort(
+                Q.text(t("q_new_name"), default=username, validate=_with_back_validator(validate_username), style=APP_STYLE, qmark="›")
+            )
+            if allow_back:
+                _raise_if_back(raw)
+            username = raw.strip()
         pwd = _ask_or_abort(
-            Q.password(t("q_new_pass"), validate=validate_new_password, style=APP_STYLE, qmark="›")
+            Q.password(t("q_new_pass"), validate=_with_back_validator(validate_new_password), style=APP_STYLE, qmark="›")
         )
+        if allow_back:
+            if _is_back_keyword(pwd):
+                need_username = True  # volta ao campo de usuário da mesma etapa
+                continue
         confirm = _ask_or_abort(Q.password(t("q_confirm_pass"), style=APP_STYLE, qmark="›"))
+        if allow_back:
+            if _is_back_keyword(confirm):
+                need_username = True
+                continue
         if pwd != confirm:
             error(t("err_pw_mismatch"))
+            need_username = False  # mantém o usuário, repete só a senha
             continue
         return username, pwd
 
@@ -192,11 +280,16 @@ def flow_create_department(admin: ClickHouseAdmin, preset_name: str = "") -> dic
     return {"id": dept_id, "nome": name.strip(), "descricao": desc.strip()}
 
 
-def ask_user_metadata(admin: ClickHouseAdmin, ch_username: str) -> UserMetadata:
+def ask_user_metadata(
+    admin: ClickHouseAdmin, ch_username: str,
+    allow_back: bool = False, defaults: dict | None = None,
+) -> UserMetadata:
     """Pergunta matrícula/nome/email + departamento (só da tabela — sem digitação livre)."""
     from clickhouse_users_cli.sql_builder import UserMetadata as _UM
 
     step(t("meta_step_t"), t("meta_step_s"))
+    if allow_back:
+        _maybe_back_hint("create")
     ensure_metadata_schema(admin)
     depts = _fetch_departments_or_abort(admin)
     if not depts:
@@ -209,36 +302,83 @@ def ask_user_metadata(admin: ClickHouseAdmin, ch_username: str) -> UserMetadata:
             raise SystemExit(1)
         depts = _fetch_departments_or_abort(admin)
 
-    matricula = _ask_or_abort(
-        Q.text(t("q_matricula"), validate=validate_matricula, style=APP_STYLE, qmark="›")
-    ).strip()
-    nome = _ask_or_abort(
-        Q.text(t("q_full_name"), validate=validate_full_name, style=APP_STYLE, qmark="›")
-    ).strip()
-    email = _ask_or_abort(
-        Q.text(t("q_email"), validate=validate_email, style=APP_STYLE, qmark="›")
-    ).strip()
+    prev: dict = dict(defaults or {})
+    # Navegação interna campo a campo: voltar no 1º campo volta à etapa
+    # anterior (credenciais); nos demais volta ao campo anterior.
+    values: dict = {
+        "matricula": str(prev.get("matricula", "")),
+        "nome": str(prev.get("nome_completo", prev.get("nome", ""))),
+        "email": str(prev.get("email_corporativo", prev.get("email", ""))),
+        "dept": prev.get("dept"),
+    }
+    order = ["matricula", "nome", "email", "dept"]
+    idx = 0
+    while idx < len(order):
+        field = order[idx]
+        if field == "matricula":
+            raw = _ask_or_abort(
+                Q.text(t("q_matricula"), default=values["matricula"], validate=_with_back_validator(validate_matricula), style=APP_STYLE, qmark="›")
+            )
+            if allow_back and _is_back_keyword(raw):
+                if idx == 0:
+                    raise BackStep()
+                idx -= 1
+                continue
+            values["matricula"] = raw.strip()
+        elif field == "nome":
+            raw = _ask_or_abort(
+                Q.text(t("q_full_name"), default=values["nome"], validate=_with_back_validator(validate_full_name), style=APP_STYLE, qmark="›")
+            )
+            if allow_back and _is_back_keyword(raw):
+                idx -= 1
+                continue
+            values["nome"] = raw.strip()
+        elif field == "email":
+            raw = _ask_or_abort(
+                Q.text(t("q_email"), default=values["email"], validate=_with_back_validator(validate_email), style=APP_STYLE, qmark="›")
+            )
+            if allow_back and _is_back_keyword(raw):
+                idx -= 1
+                continue
+            values["email"] = raw.strip()
+        else:
+            # Departamento: apenas escolha da lista existente (nada de texto livre).
+            choices = [Q.Choice(f"{d['nome']}" + (f" — {d['descricao']}" if d.get("descricao") else ""), value=d) for d in depts]
+            default_dept = values["dept"] if values["dept"] in depts else None
+            if allow_back:
+                choices.append(_back_choice())
+            dept = _ask_or_abort(
+                Q.select(
+                    t("q_dept"),
+                    choices=choices,
+                    **({"default": default_dept} if default_dept is not None else {}),
+                    style=APP_STYLE, qmark="›",
+                    instruction=t("nav_hint"),
+                )
+            )
+            if allow_back and dept == BACK_VALUE:
+                idx -= 1
+                continue
+            values["dept"] = dept
+        idx += 1
 
-    # Departamento: apenas escolha da lista existente (nada de texto livre).
-    dept = _ask_or_abort(
-        Q.select(
-            t("q_dept"),
-            choices=[Q.Choice(f"{d['nome']}" + (f" — {d['descricao']}" if d.get("descricao") else ""), value=d) for d in depts],
-            style=APP_STYLE, qmark="›",
-            instruction=t("nav_hint"),
-        )
-    )
+    dept = values["dept"]
     return _UM(
-        usuario=ch_username, matricula=matricula, nome_completo=nome,
-        email_corporativo=email, departamento_id=dept["id"], departamento_nome=dept["nome"],
+        usuario=ch_username, matricula=values["matricula"], nome_completo=values["nome"],
+        email_corporativo=values["email"], departamento_id=dept["id"], departamento_nome=dept["nome"],
         created_by=admin.conn.username,
     )
 
 
 # ── Etapa 4: escopo (bancos → tabelas) ────────────────────────────────────────
 
-def ask_databases(admin: ClickHouseAdmin, mode: str = "create") -> list[str]:
+def ask_databases(
+    admin: ClickHouseAdmin, mode: str = "create",
+    allow_back: bool = False, defaults: list[str] | None = None,
+) -> list[str]:
     step(t("estep_dbs_t") if mode == "edit" else t("step_dbs_t"), t("scope_hint"))
+    if allow_back:
+        _maybe_back_hint("create")
     with console.status(t("listing_dbs"), spinner="dots"):
         try:
             databases = admin.list_databases()
@@ -250,15 +390,18 @@ def ask_databases(admin: ClickHouseAdmin, mode: str = "create") -> list[str]:
         error(t("err_no_dbs"))
         raise SystemExit(1)
 
+    prev = set(defaults or [])
     choices = [Q.Choice(title=t("all_dbs"), value="__ALL__")] + [
         Q.Choice(
             title=t("db_system_tag", db=db) if db in SYSTEM_DATABASES else db,
             value=db,
             # UX: nada pré-marcado (least privilege) — o usuário opta explicitamente.
-            checked=False,
+            checked=(db in prev),
         )
         for db in databases
     ]
+    if allow_back:
+        choices.append(_back_choice())
     selected = _ask_or_abort(
         Q.checkbox(
             t("q_which_dbs"),
@@ -268,13 +411,24 @@ def ask_databases(admin: ClickHouseAdmin, mode: str = "create") -> list[str]:
             instruction=t("check_hint"),
         )
     )
+    if allow_back and BACK_VALUE in (selected or []):
+        raise BackStep()
     if "__ALL__" in selected:
         return list(databases)
     return selected
 
 
-def ask_tables(admin: ClickHouseAdmin, databases: list[str], mode: str = "create") -> list[GrantScope]:
+def ask_tables(
+    admin: ClickHouseAdmin, databases: list[str], mode: str = "create",
+    allow_back: bool = False, defaults: list[GrantScope] | None = None,
+) -> list[GrantScope]:
     step(t("estep_tables_t") if mode == "edit" else t("step_tables_t"), t("scope_tables_hint"))
+    if allow_back:
+        _maybe_back_hint("create")
+    prev_by_db: dict[str, set[str | None]] = {}
+    for s in defaults or []:
+        prev_by_db.setdefault(s.database, set()).add(s.table)
+    star_all = "*" in prev_by_db  # GRANT ON *.* vigente: tudo pré-marcado
     scopes: list[GrantScope] = []
     for db in databases:
         try:
@@ -289,9 +443,13 @@ def ask_tables(admin: ClickHouseAdmin, databases: list[str], mode: str = "create
             scopes.append(GrantScope(database=db, table=None))
             continue
 
-        choices = [Q.Choice(title=t("all_tables", db=db), value="__ALL__")] + [
-            Q.Choice(title=f"{db}.{t}", value=t) for t in tables
+        prev = prev_by_db.get(db, set())
+        prev_all = star_all or None in prev or "*" in prev
+        choices = [Q.Choice(title=t("all_tables", db=db), value="__ALL__", checked=prev_all)] + [
+            Q.Choice(title=f"{db}.{t}", value=t, checked=(t in prev or prev_all)) for t in tables
         ]
+        if allow_back:
+            choices.append(_back_choice())
         picked: list[str] = _ask_or_abort(
             Q.checkbox(
                 t("q_tables", db=db),
@@ -301,6 +459,8 @@ def ask_tables(admin: ClickHouseAdmin, databases: list[str], mode: str = "create
                 instruction=t("check_hint"),
             )
         )
+        if allow_back and BACK_VALUE in (picked or []):
+            raise BackStep()
         if "__ALL__" in picked:
             scopes.append(GrantScope(database=db, table=None))
         else:
@@ -323,60 +483,92 @@ PRIVILEGE_CHOICES = [
 ]
 
 
-def ask_privileges(profile: str, mode: str = "create") -> tuple[list[str], bool]:
+def ask_privileges(
+    profile: str, mode: str = "create",
+    allow_back: bool = False, defaults: tuple[list[str], bool] | None = None,
+) -> tuple[list[str], bool]:
     """Retorna (privilégios, grant_option)."""
     if profile != "custom":
         grant_option = profile == "admin"
         return list(PROFILE_PRIVILEGES[profile]), grant_option
 
     step(t("estep_privs_t") if mode == "edit" else t("step_privs_t"), t("privs_hint"))
+    if allow_back:
+        _maybe_back_hint("create")
+    prev_privs = list((defaults or ([], False))[0])
+    prev_grant = bool((defaults or ([], False))[1])
+    choices = [Q.Choice(f"{name:12} — {desc}", value=name, checked=(name in prev_privs)) for name, desc in PRIVILEGE_CHOICES]
+    if allow_back:
+        choices.append(_back_choice())
     privs: list[str] = _ask_or_abort(
         Q.checkbox(
             t("q_which_privs"),
-            choices=[Q.Choice(f"{name:12} — {desc}", value=name) for name, desc in PRIVILEGE_CHOICES],
+            choices=choices,
             validate=validate_at_least_one,
             style=APP_STYLE, qmark="›",
         )
     )
+    if allow_back and BACK_VALUE in (privs or []):
+        raise BackStep()
     grant_option = False
     if any(p in privs for p in ("DROP", "TRUNCATE")):
-        grant_option_confirm = _ask_or_abort(
-            Q.confirm(t("q_destructive"), default=False, style=APP_STYLE, qmark="›")
-        )
+        if allow_back:
+            grant_option_confirm = _ask_confirm_or_back(t("q_destructive"), default=False)
+        else:
+            grant_option_confirm = _ask_or_abort(
+                Q.confirm(t("q_destructive"), default=False, style=APP_STYLE, qmark="›")
+            )
         if not grant_option_confirm:
-            return ask_privileges("custom", mode=mode)
+            return ask_privileges("custom", mode=mode, allow_back=allow_back, defaults=defaults)
     else:
-        grant_option = _ask_or_abort(
-            Q.confirm(t("q_grant_option"), default=False, style=APP_STYLE, qmark="›")
-        )
+        if allow_back:
+            grant_option = _ask_confirm_or_back(t("q_grant_option"), default=prev_grant)
+        else:
+            grant_option = _ask_or_abort(
+                Q.confirm(t("q_grant_option"), default=False, style=APP_STYLE, qmark="›")
+            )
     return privs, grant_option
 
 
-def ask_host_restriction() -> list[str]:
+def ask_host_restriction(
+    allow_back: bool = False, default_mode: str = "any", default_hosts: str = "",
+) -> list[str]:
     step(t("step_host_t"), t("step_host_s"))
+    if allow_back:
+        _maybe_back_hint("create")
+    choices = [
+        Q.Choice(t("host_any"), value="any"),
+        Q.Choice(t("host_local"), value="localhost"),
+        Q.Choice(t("host_custom"), value="custom"),
+    ]
+    if allow_back:
+        choices.append(_back_choice())
     mode = _ask_or_abort(
         Q.select(
             t("q_allow_from"),
-            choices=[
-                Q.Choice(t("host_any"), value="any"),
-                Q.Choice(t("host_local"), value="localhost"),
-                Q.Choice(t("host_custom"), value="custom"),
-            ],
-            default="any",
+            choices=choices,
+            default=default_mode if default_mode in ("any", "localhost", "custom") else "any",
             style=APP_STYLE, qmark="›",
         )
     )
+    if allow_back:
+        _raise_if_back(mode)
     if mode == "any":
         return []
     if mode == "localhost":
         return ["LOCALHOST"]
     raw = _ask_or_abort(
-        Q.text(t("q_hosts"), validate=validate_required, style=APP_STYLE, qmark="›")
+        Q.text(t("q_hosts"), default=default_hosts, validate=_with_back_validator(validate_required), style=APP_STYLE, qmark="›")
     )
+    if allow_back:
+        _raise_if_back(raw)
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 
-def ask_create_options() -> bool:
+def ask_create_options(allow_back: bool = False, default: bool = True) -> bool:
+    if allow_back:
+        _maybe_back_hint("create")
+        return _ask_confirm_or_back(t("q_if_not_exists"), default=default)
     return _ask_or_abort(
         Q.confirm(t("q_if_not_exists"), default=True, style=APP_STYLE, qmark="›")
     )
@@ -408,12 +600,32 @@ def show_review(spec: UserSpec, meta: UserMetadata | None = None) -> None:
         console.print(RichPanel(Syntax(sql + ";", "sql", theme="monokai"), border_style="dim"))
 
 
-def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec, meta: UserMetadata | None = None) -> None:
+def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec, meta: UserMetadata | None = None, allow_back: bool = False) -> None:
     show_review(spec, meta)
-    go = _ask_or_abort(Q.confirm(t("q_create_now", username=spec.username), default=True, style=APP_STYLE, qmark="›"))
-    if not go:
-        console.print(t("nothing_done"))
-        raise SystemExit(0)
+    if allow_back:
+        nav = _ask_or_abort(
+            Q.select(
+                t("q_review_nav", username=spec.username),
+                choices=[
+                    Q.Choice(t("opt_create_confirm"), value="create"),
+                    Q.Choice(t("opt_adjust"), value="adjust"),
+                    Q.Choice(t("opt_cancel"), value="cancel"),
+                ],
+                default="create",
+                style=APP_STYLE, qmark="›",
+                instruction=t("nav_hint"),
+            )
+        )
+        if nav == "adjust":
+            raise BackStep()
+        if nav == "cancel":
+            console.print(t("nothing_done"))
+            raise SystemExit(0)
+    else:
+        go = _ask_or_abort(Q.confirm(t("q_create_now", username=spec.username), default=True, style=APP_STYLE, qmark="›"))
+        if not go:
+            console.print(t("nothing_done"))
+            raise SystemExit(0)
 
     statements = build_all_statements(spec)
     with console.status(t("running_ddl"), spinner="dots"):
@@ -434,6 +646,11 @@ def confirm_and_execute(admin: ClickHouseAdmin, spec: UserSpec, meta: UserMetada
                 info(t("hint_meta_perms", db=get_metadata_db()))
                 raise SystemExit(1)
         success(t("meta_saved", username=spec.username))
+    # Snapshot dos acessos em user_access (o que cada usuário tem acesso).
+    try:
+        admin.sync_user_access(spec.username, spec.privileges, spec.scopes, spec.grant_option)
+    except Exception:
+        pass
     info(t("test_hint", username=spec.username))
 
 
@@ -533,6 +750,8 @@ def ask_main_action(show_forget: bool = False) -> str:
         Q.Choice(t("act_list"), value="list"),
         Q.Choice(t("act_manage"), value="manage"),
         Q.Choice(t("act_depts"), value="depts"),
+        Q.Choice(t("act_access"), value="access"),
+        Q.Choice(t("act_logs"), value="logs"),
     ]
     if show_forget:
         choices.append(Q.Choice(t("act_forget"), value="forget"))
@@ -568,6 +787,14 @@ def show_user_details(admin: ClickHouseAdmin, username: str) -> tuple[str, list[
         meta = admin.get_user_metadata(username)
     except Exception:
         meta = None
+    try:
+        accesses = admin.list_user_access(username)
+    except Exception:
+        accesses = []
+    try:
+        logs = admin.list_usage_logs(username, limit=5)
+    except Exception:
+        logs = []
 
     table = make_table(t("user_title", username=username))
     table.add_column(t("col_field"), style="dim")
@@ -579,10 +806,34 @@ def show_user_details(admin: ClickHouseAdmin, username: str) -> tuple[str, list[
         table.add_row(t("f_full_name"), meta.get("nome_completo", ""))
         table.add_row(t("f_email"), meta.get("email_corporativo", ""))
         table.add_row(t("f_dept"), meta.get("departamento_nome", ""))
+        if meta.get("updated_at"):
+            table.add_row(t("f_updated"), str(meta.get("updated_at", "")))
+        table.add_row(t("f_deleted"), t("yes") if meta.get("deleted") else t("no"))
+        table.add_row(t("f_deactivated"), t("yes") if meta.get("deactivated") else t("no"))
     else:
         table.add_row(t("f_dept"), t("meta_none"))
     table.add_row(t("col_grants"), "\n".join(grants) if grants else t("grants_none"))
     console.print(table)
+
+    if accesses:
+        acc = make_table(t("access_title", username=username, n=len(accesses)))
+        acc.add_column(t("col_privs"), style="bold")
+        acc.add_column(t("col_scope"), style="bold")
+        acc.add_column(t("col_grant"), style="dim")
+        for a in accesses:
+            scope = f"{a['database']}.*" if not a.get("tabela") else f"{a['database']}.{a['tabela']}"
+            acc.add_row(a.get("privilegios", ""), scope, t("yes") if a.get("grant_option") else t("no"))
+        console.print(acc)
+    else:
+        info(t("access_none", username=username))
+
+    if logs:
+        lg = make_table(t("logs_title", username=username, n=len(logs)))
+        lg.add_column(t("col_query"), style="dim")
+        lg.add_column(t("col_tables"), style="bold")
+        for e in logs:
+            lg.add_row((e.get("query", "")[:80]), ", ".join(e.get("tabelas", []) or []))
+        console.print(lg)
 
     if create_sql:
         console.print(t("current_def"))
@@ -630,17 +881,47 @@ def flow_list_users(admin: ClickHouseAdmin) -> None:
 
 
 def flow_edit_grants(admin: ClickHouseAdmin, username: str) -> None:
-    """Redefine os acessos: REVOKE ALL + GRANTs novos (perfil + escopo + hosts intactos)."""
+    """Redefine os acessos: REVOKE ALL + GRANTs novos (perfil + escopo + hosts intactos).
+
+    Os acessos atuais (SHOW GRANTS FOR) vêm pré-marcados — para acrescentar
+    algo, basta marcar o novo item e confirmar; o resto segue igual.
+    """
+    from clickhouse_users_cli.sql_builder import infer_profile, parse_grants
+
     step(t("step_edit_t"), t("step_edit_s"))
     if username == admin.conn.username:
         warn(t("self_warn_zero", username=username))
 
-    profile = ask_profile(mode="edit")
-    privileges, grant_option = ask_privileges(profile, mode="edit")
+    # Estado atual = cache da edição. Falhou? Segue em branco (comportamento antigo).
+    try:
+        current_rows = admin.show_grants(username)
+    except Exception:
+        current_rows = []
+    cur_privs, cur_scopes, cur_grant, hetero = parse_grants(current_rows)
+    cur_profile = infer_profile(cur_privs, cur_grant) if cur_privs else "readonly"
+    if hetero:
+        info(t("edit_hetero_note"))
+    if cur_scopes:
+        info(t("edit_prefill_note", n=len(cur_scopes)))
+
+    profile = ask_profile(mode="edit", default_profile=cur_profile)
+    if profile == "custom":
+        privileges, grant_option = ask_privileges(
+            profile, mode="edit", defaults=(cur_privs, cur_grant),
+        )
+    else:
+        privileges, grant_option = ask_privileges(profile, mode="edit")
     if profile == "admin":
         grant_option = True
-    databases = ask_databases(admin, mode="edit")
-    scopes = ask_tables(admin, databases, mode="edit")
+    if any(s.database == "*" for s in cur_scopes):
+        try:
+            db_defaults: list[str] | None = admin.list_databases()
+        except Exception:
+            db_defaults = None
+    else:
+        db_defaults = sorted({s.database for s in cur_scopes})
+    databases = ask_databases(admin, mode="edit", defaults=db_defaults or None)
+    scopes = ask_tables(admin, databases, mode="edit", defaults=cur_scopes or None)
 
     statements = build_edit_grants_statements(username, privileges, scopes, grant_option)
     table = make_table(t("new_access_title", username=username))
@@ -670,6 +951,10 @@ def flow_edit_grants(admin: ClickHouseAdmin, username: str) -> None:
             info(t("hint_edit"))
             return
     success(t("updated", username=username, n=len(statements)))
+    try:  # mantém user_access espelhado com os grants reais
+        admin.sync_user_access(username, privileges, scopes, grant_option)
+    except Exception:
+        pass
 
 
 # ── Departamentos (CRUD) ────────────────────────────────────────────────────
@@ -834,27 +1119,168 @@ def flow_manage_users(admin: ClickHouseAdmin) -> None:
 
 
 def flow_create_user(admin: ClickHouseAdmin) -> None:
-    profile = ask_profile()
-    username, password = ask_new_credentials()
-    meta = ask_user_metadata(admin, username)
-    databases = ask_databases(admin)
-    scopes = ask_tables(admin, databases)
-    privileges, grant_option = ask_privileges(profile)
-    if profile == "admin":
-        grant_option = True
-    hosts = ask_host_restriction()
-    if_not_exists = ask_create_options()
+    """Assistente de criação com voltar: cada etapa aceita retornar à anterior.
 
-    spec = UserSpec(
-        username=username,
-        password=password,
-        privileges=privileges,
-        scopes=scopes,
-        hosts=hosts,
-        if_not_exists=if_not_exists,
-        grant_option=grant_option,
+    Os valores já digitados são reaproveitados como padrão ao avançar de novo,
+    então corrigir uma etapa não obriga redigitar tudo.
+    """
+    state: dict = {}
+    idx = 0
+    while True:
+        try:
+            if idx == 0:
+                state["profile"] = ask_profile(
+                    allow_back=False, default_profile=state.get("profile", "readonly"),
+                )
+                idx = 1
+            elif idx == 1:
+                username, password = ask_new_credentials(
+                    allow_back=True, default_username=state.get("username", ""),
+                )
+                state["username"], state["password"] = username, password
+                idx = 2
+            elif idx == 2:
+                meta = ask_user_metadata(
+                    admin, state["username"],
+                    allow_back=True, defaults=state.get("meta_defaults"),
+                )
+                state["meta"] = meta
+                state["meta_defaults"] = {
+                    "matricula": meta.matricula,
+                    "nome_completo": meta.nome_completo,
+                    "email_corporativo": meta.email_corporativo,
+                    "dept": {"id": meta.departamento_id, "nome": meta.departamento_nome},
+                }
+                idx = 3
+            elif idx == 3:
+                state["databases"] = ask_databases(
+                    admin, allow_back=True, defaults=state.get("databases"),
+                )
+                idx = 4
+            elif idx == 4:
+                state["scopes"] = ask_tables(
+                    admin, state["databases"], allow_back=True, defaults=state.get("scopes"),
+                )
+                idx = 5
+            elif idx == 5:
+                privileges, grant_option = ask_privileges(
+                    state["profile"], allow_back=True, defaults=state.get("priv_defaults"),
+                )
+                if state["profile"] == "admin":
+                    grant_option = True
+                state["privileges"], state["grant_option"] = privileges, grant_option
+                state["priv_defaults"] = (privileges, grant_option)
+                idx = 6
+            elif idx == 6:
+                state["hosts"] = ask_host_restriction(
+                    allow_back=True,
+                    default_mode=state.get("host_mode", "any"),
+                    default_hosts=state.get("hosts_text", ""),
+                )
+                # Guarda o modo p/ pré-selecionar ao voltar: [] = any, [LOCALHOST] = localhost.
+                hosts = state["hosts"]
+                if not hosts:
+                    state["host_mode"] = "any"
+                elif len(hosts) == 1 and hosts[0] == "LOCALHOST":
+                    state["host_mode"] = "localhost"
+                else:
+                    state["host_mode"] = "custom"
+                    state["hosts_text"] = ", ".join(hosts)
+                idx = 7
+            elif idx == 7:
+                state["if_not_exists"] = ask_create_options(
+                    allow_back=True, default=state.get("if_not_exists", True),
+                )
+                idx = 8
+            else:
+                spec = UserSpec(
+                    username=state["username"],
+                    password=state["password"],
+                    privileges=state["privileges"],
+                    scopes=state["scopes"],
+                    hosts=state["hosts"],
+                    if_not_exists=state.get("if_not_exists", True),
+                    grant_option=state.get("grant_option", False),
+                )
+                confirm_and_execute(admin, spec, state.get("meta"), allow_back=True)
+                return
+        except BackStep:
+            idx = max(0, idx - 1)
+            info(t("back_to_prev"))
+            continue
+
+
+# ── Acessos + logs de utilização (auditoria) ──────────────────────────────────
+
+def _pick_user(admin: ClickHouseAdmin) -> str | None:
+    try:
+        users = admin.list_users()
+    except Exception as e:
+        error(t("err_list_users", e=e))
+        return None
+    if not users:
+        info(t("no_users"))
+        return None
+    return _ask_or_abort(
+        Q.select(t("q_which_user"), choices=users, style=APP_STYLE, qmark="›", instruction=t("nav_hint"))
     )
-    confirm_and_execute(admin, spec, meta)
+
+
+def flow_show_access(admin: ClickHouseAdmin) -> None:
+    step(t("step_access_t"), t("step_access_s"))
+    ensure_metadata_schema(admin)
+    target = _pick_user(admin)
+    if not target:
+        return
+    try:
+        accesses = admin.list_user_access(target)
+    except Exception as e:
+        error(t("err_op", e=e))
+        return
+    if not accesses:
+        info(t("access_none", username=target))
+        return
+    table = make_table(t("access_title", username=target, n=len(accesses)))
+    table.add_column(t("col_privs"), style="bold")
+    table.add_column(t("col_scope"), style="bold")
+    table.add_column(t("col_grant"), style="dim")
+    for a in accesses:
+        scope = f"{a['database']}.*" if not a.get("tabela") else f"{a['database']}.{a['tabela']}"
+        table.add_row(a.get("privilegios", ""), scope, t("yes") if a.get("grant_option") else t("no"))
+    console.print(table)
+
+
+def flow_show_logs(admin: ClickHouseAdmin) -> None:
+    step(t("step_logs_t"), t("step_logs_s"))
+    ensure_metadata_schema(admin)
+    target = _pick_user(admin)
+    if not target:
+        return
+    sync = _ask_or_abort(Q.confirm(t("q_import_log", username=target), default=False, style=APP_STYLE, qmark="›"))
+    if sync:
+        with console.status(t("running"), spinner="dots"):
+            try:
+                admin.import_query_log(target, limit=100)
+                success(t("logs_imported", username=target))
+            except Exception as e:
+                error(t("err_op", e=e))
+                info(t("hint_query_log"))
+    try:
+        logs = admin.list_usage_logs(target, limit=20)
+    except Exception as e:
+        error(t("err_op", e=e))
+        return
+    if not logs:
+        info(t("logs_none", username=target))
+        return
+    table = make_table(t("logs_title", username=target, n=len(logs)))
+    table.add_column(t("col_when"), style="dim")
+    table.add_column(t("col_query"), style="dim")
+    table.add_column(t("col_tables"), style="bold")
+    table.add_column(t("col_status"), style="dim")
+    for e in logs:
+        table.add_row(str(e.get("executada_em", "")), (e.get("query", "")[:80]), ", ".join(e.get("tabelas", []) or []), str(e.get("status", "")))
+    console.print(table)
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -880,6 +1306,10 @@ def main() -> None:
                 flow_manage_users(admin)
             elif action == "depts":
                 flow_manage_departments(admin)
+            elif action == "access":
+                flow_show_access(admin)
+            elif action == "logs":
+                flow_show_logs(admin)
             elif action == "forget":
                 flow_forget_session()
             else:
