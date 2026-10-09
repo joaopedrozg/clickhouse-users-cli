@@ -227,8 +227,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "sql_no_privs": "Nenhum privilégio selecionado.",
         # Metadados do colaborador (obrigatório na criação)
         "meta_step_t": "3b/6 · Dados do colaborador",
-        "meta_step_s": "Matrícula, nome, email e departamento (vem da tabela de departamentos).",
-        "q_matricula": "Matrícula:",
+        "meta_step_s": "Matrícula (opcional), nome, email e departamento (vem da tabela de departamentos).",
+        "q_matricula": "Matrícula (opcional, enter = pular):",
         "q_full_name": "Nome completo:",
         "q_email": "Email corporativo:",
         "q_dept": "Departamento:",
@@ -511,8 +511,8 @@ STRINGS: dict[str, dict[str, str]] = {
         "sql_no_privs": "No privileges selected.",
         # User metadata (required at creation)
         "meta_step_t": "3b/6 · Employee data",
-        "meta_step_s": "Employee ID, name, email and department (must come from the departments table).",
-        "q_matricula": "Employee ID (matricula):",
+        "meta_step_s": "Employee ID (optional), name, email and department (must come from the departments table).",
+        "q_matricula": "Employee ID (optional, enter = skip):",
         "q_full_name": "Full name:",
         "q_email": "Corporate email:",
         "q_dept": "Department:",
