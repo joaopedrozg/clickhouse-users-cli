@@ -583,7 +583,7 @@ def show_review(spec: UserSpec, meta: UserMetadata | None = None) -> None:
     table.add_column(t("col_value"), style="bold")
     table.add_row(t("f_user"), spec.username)
     if meta is not None:
-        table.add_row(t("f_matricula"), meta.matricula)
+        table.add_row(t("f_matricula"), meta.matricula or "—")
         table.add_row(t("f_full_name"), meta.nome_completo)
         table.add_row(t("f_email"), meta.email_corporativo)
         table.add_row(t("f_dept"), meta.departamento_nome)
@@ -802,7 +802,7 @@ def show_user_details(admin: ClickHouseAdmin, username: str) -> tuple[str, list[
     status = t("status_inactive") if _is_inactive(create_sql) else t("status_active")
     table.add_row(t("col_status"), status)
     if meta:
-        table.add_row(t("f_matricula"), meta.get("matricula", ""))
+        table.add_row(t("f_matricula"), meta.get("matricula", "") or "—")
         table.add_row(t("f_full_name"), meta.get("nome_completo", ""))
         table.add_row(t("f_email"), meta.get("email_corporativo", ""))
         table.add_row(t("f_dept"), meta.get("departamento_nome", ""))

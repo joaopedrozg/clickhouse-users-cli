@@ -66,7 +66,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 def validate_matricula(value: str) -> bool | str:
     v = (value or "").strip()
     if not v:
-        return t("v_required")
+        return True  # opcional — vazio = sem matrícula
     if not MATRICULA_RE.match(v):
         return t("v_matricula_invalid")
     return True
