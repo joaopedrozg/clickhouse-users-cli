@@ -231,6 +231,7 @@ DEPARTMENTS_TABLE = "departments"
 USER_METADATA_TABLE = "user_metadata"
 USER_ACCESS_TABLE = "user_access"
 USAGE_LOGS_TABLE = "usage_logs"
+USAGE_LOGS_VIEW = "v_usage_logs"
 
 
 def get_metadata_db() -> str:
@@ -355,6 +356,18 @@ def build_create_usage_logs_table_sql(db: str | None = None, table: str = USAGE_
         f"`executada_em` DateTime DEFAULT now(), `duracao_ms` UInt32 DEFAULT 0, "
         f"`status` String DEFAULT 'OK', `created_by` String DEFAULT '') "
         f"ENGINE = MergeTree ORDER BY (`usuario`, `executada_em`, `id`)"
+    )
+
+
+def build_create_usage_logs_view_sql(db: str | None = None, view: str = USAGE_LOGS_VIEW) -> str:
+    """VIEW viva sobre system.query_log — sem import, sem duplicar, sempre fresca."""
+    db = db or get_metadata_db()
+    return (
+        f"CREATE OR REPLACE VIEW {escape_ident(db)}.{escape_ident(view)} AS "
+        f"SELECT `user` AS `usuario`, `query`, `tables` AS `tabelas`, "
+        f"CAST(`query_kind` AS String) AS `tipo_query`, `event_time` AS `executada_em`, "
+        f"toUInt32(`query_duration_ms`) AS `duracao_ms`, CAST(`type` AS String) AS `status` "
+        f"FROM system.query_log WHERE `type` = 'QueryFinish'"
     )
 
 
