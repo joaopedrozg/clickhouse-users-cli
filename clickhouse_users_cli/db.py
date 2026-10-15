@@ -143,6 +143,7 @@ class ClickHouseAdmin:
             build_create_departments_table_sql,
             build_create_metadata_db_sql,
             build_create_usage_logs_table_sql,
+            build_create_usage_logs_view_sql,
             build_create_user_access_table_sql,
             build_create_user_metadata_table_sql,
             get_metadata_db,
@@ -160,6 +161,10 @@ class ClickHouseAdmin:
                 pass  # coluna já existe em versões antigas do CH sem IF NOT EXISTS
         self.client.command(build_create_user_access_table_sql(meta_db))
         self.client.command(build_create_usage_logs_table_sql(meta_db))
+        try:  # VIEW viva sobre system.query_log (best-effort: sem SELECT nela, só cria)
+            self.client.command(build_create_usage_logs_view_sql(meta_db))
+        except Exception:
+            pass
         return meta_db
 
     def list_departments(self, db: str | None = None) -> list[dict]:
@@ -414,7 +419,7 @@ class ClickHouseAdmin:
 
     def list_usage_logs(self, username: str, limit: int = 20, db: str | None = None) -> list[dict]:
         from clickhouse_users_cli.sql_builder import (
-            USAGE_LOGS_TABLE,
+            USAGE_LOGS_VIEW,
             escape_ident,
             escape_string,
             get_metadata_db,
@@ -422,12 +427,22 @@ class ClickHouseAdmin:
 
         meta_db = db or get_metadata_db()
         lim = max(1, int(limit))
-        rows = self.client.query(
-            f"SELECT `query`, `tabelas`, `tipo_query`, `executada_em`, `duracao_ms`, `status` "
-            f"FROM {escape_ident(meta_db)}.{escape_ident(USAGE_LOGS_TABLE)} "
-            f"WHERE `usuario` = {escape_string(username)} "
-            f"ORDER BY `executada_em` DESC LIMIT {lim}"
-        ).result_rows
+        try:
+            rows = self.client.query(
+                f"SELECT `query`, `tabelas`, `tipo_query`, `executada_em`, `duracao_ms`, `status` "
+                f"FROM {escape_ident(meta_db)}.{escape_ident(USAGE_LOGS_VIEW)} "
+                f"WHERE `usuario` = {escape_string(username)} "
+                f"ORDER BY `executada_em` DESC LIMIT {lim}"
+            ).result_rows
+        except Exception:
+            # Fallback: VIEW ainda não criada (servidor antigo sem OR REPLACE) — lê direto.
+            rows = self.client.query(
+                f"SELECT `query`, `tables`, CAST(`query_kind` AS String), `event_time`, "
+                f"toUInt32(`query_duration_ms`), CAST(`type` AS String) "
+                f"FROM system.query_log "
+                f"WHERE `user` = {escape_string(username)} AND `type` = 'QueryFinish' "
+                f"ORDER BY `event_time` DESC LIMIT {lim}"
+            ).result_rows
         out: list[dict] = []
         for r in rows or []:
             if not r:

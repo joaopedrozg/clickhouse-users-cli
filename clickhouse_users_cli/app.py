@@ -1256,19 +1256,12 @@ def flow_show_logs(admin: ClickHouseAdmin) -> None:
     target = _pick_user(admin)
     if not target:
         return
-    sync = _ask_or_abort(Q.confirm(t("q_import_log", username=target), default=False, style=APP_STYLE, qmark="›"))
-    if sync:
-        with console.status(t("running"), spinner="dots"):
-            try:
-                admin.import_query_log(target, limit=100)
-                success(t("logs_imported", username=target))
-            except Exception as e:
-                error(t("err_op", e=e))
-                info(t("hint_query_log"))
+    # VIEW viva sobre system.query_log — sem import manual.
     try:
         logs = admin.list_usage_logs(target, limit=20)
     except Exception as e:
         error(t("err_op", e=e))
+        info(t("hint_query_log"))
         return
     if not logs:
         info(t("logs_none", username=target))
